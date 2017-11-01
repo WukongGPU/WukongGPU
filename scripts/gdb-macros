@@ -1,0 +1,5 @@
+define wukong-go
+    f 2
+    set variable i=1
+end
+

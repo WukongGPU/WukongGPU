@@ -1,0 +1,8 @@
+SELECT ?p1 ?p2 WHERE {
+    ?p1 __PREDICATE__ y:hasWonPrize <-
+    ?p1 y:hasWonPrize ?award .
+    ?p2 y:hasWonPrize ?award <-
+    ?p2 y:wasBornIn ?city .
+    ?p1 y:wasBornIn ?city <-
+}
+

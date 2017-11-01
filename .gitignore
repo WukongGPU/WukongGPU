@@ -1,0 +1,7 @@
+.git/
+cscope*
+*.swp
+.ycm*
+.settings/
+.project
+

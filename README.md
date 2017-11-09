@@ -103,6 +103,19 @@ Add below settings to bash script (i.e., `~/.bashrc`).
     export LD_LIBRARY_PATH=$WUKONG_ROOT/deps/zeromq-4.0.5-install/lib:$LD_LIBRARY_PATH
 
 
+#### Install [CUDA 8.0 Toolkit](https://developer.nvidia.com/cuda-toolkit)
+
+#### Install NVDIA GPUDirect Kernel Module
+    $tar xzf nvidia-peer-memory-1.0-3.tar.gz
+    $cd nvidia-peer-memory-1.0
+    $tar xzf nvidia-peer-memory_1.0.orig.tar.gz
+    $cd nvidia-peer-memory-1.0
+    $dpkg-buildpackage -us -uc
+    $cd ..
+    $sudo dpkg -i nvidia-peer-memory_1.0-3_all.deb
+    $sudo dpkg -i nvidia-peer-memory-dkms_1.0-3_all.deb
+
+
 #### Install HDFS support (Optional)
 
 We assume that Hadoop/HDFS has been installed on your cluster. The ENV variable for Hadoop should be set correctly.

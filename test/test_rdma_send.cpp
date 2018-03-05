@@ -3,7 +3,6 @@
 #include <iostream>
 #include <cstdio>
 
-#include "config.hpp"
 #include "mem.hpp"
 #include "string_server.hpp"
 #include "dgraph.hpp"

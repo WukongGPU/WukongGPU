@@ -40,6 +40,9 @@
 #include "gstore.hpp"
 #include "timer.hpp"
 #include "rdf_meta.hpp"
+#include "mem.hpp"
+#include "hdfs.hpp"
+#include "mymath.hpp"
 
 using namespace std;
 

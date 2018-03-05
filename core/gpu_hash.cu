@@ -501,10 +501,10 @@ int update_result_table_i2u(int *result_table,
 
 {
     int table_size = 0;//index_list[query_size-1];
-    cudaMemcpy(&table_size,
+    CUDA_SAFE_CALL( cudaMemcpyAsync(&table_size,
                index_list,
                sizeof(int),
-               cudaMemcpyDeviceToHost);
+               cudaMemcpyDeviceToHost, stream_id) );
 
     int gridsize = (int) (ceil((double)table_size / (blocksize * blocksize)));
     dim3 dimBlock = dim3(blocksize, blocksize, 1);
@@ -519,6 +519,7 @@ int update_result_table_i2u(int *result_table,
          pred_edge_shard_size
          );
 
+    CUDA_SAFE_CALL( cudaStreamSynchronize(stream_id) );
     return table_size;
 
 }
@@ -583,10 +584,10 @@ int update_result_table_k2u(int *result_table,
 
 {
     int table_size = 0;//index_list[query_size-1];
-    cudaMemcpy(&table_size,
+    CUDA_SAFE_CALL( cudaMemcpyAsync(&table_size,
                index_list+query_size-1,
                sizeof(int),
-               cudaMemcpyDeviceToHost);
+               cudaMemcpyDeviceToHost, stream_id) );
 
     //query_size = query_size*200*(column_num+1);
     int gridsize = (int) (ceil((double)query_size / (blocksize * blocksize)));
@@ -603,6 +604,7 @@ int update_result_table_k2u(int *result_table,
          pred_edge_shard_size,
          query_size);
 
+    CUDA_SAFE_CALL( cudaStreamSynchronize(stream_id) );
     return table_size*(column_num+1);
 
 }
@@ -656,10 +658,10 @@ int update_result_table_k2k(int *result_table,
 
 {
     int table_size = 0;//index_list[query_size-1];
-    cudaMemcpy(&table_size,
+    CUDA_SAFE_CALL( cudaMemcpyAsync(&table_size,
                index_list+query_size-1,
                sizeof(int),
-               cudaMemcpyDeviceToHost);
+               cudaMemcpyDeviceToHost, stream_id) );
 
     int gridsize = (int) (ceil((double)query_size / (blocksize * blocksize)));
     dim3 dimBlock = dim3(blocksize, blocksize, 1);
@@ -674,6 +676,7 @@ int update_result_table_k2k(int *result_table,
          end,
          query_size);
 
+    CUDA_SAFE_CALL( cudaStreamSynchronize(stream_id) );
     return table_size*column_num;
 
 }

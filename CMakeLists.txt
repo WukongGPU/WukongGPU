@@ -29,7 +29,6 @@ add_definitions(-DHAS_RDMA)
 #add_definitions(-DVERSATILE)
 
 ## Set include path
-include_directories(deps/hiredis)
 include_directories(deps/boost_1_58_0-install/include)
 include_directories(core)
 include_directories(utils)
@@ -60,4 +59,5 @@ file(GLOB SOURCES "core/*.hpp" "utils/*.hpp")
 cuda_add_executable(wukong ${SOURCES} "core/wukong.cpp" build/gpu_hash.o)
 target_link_libraries(wukong zmq rt ibverbs tbb ${BOOST_LIB}/libboost_mpi.a ${BOOST_LIB}/libboost_serialization.a
     -L${CUDA_LIB} -lcudart)
+
 

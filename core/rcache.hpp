@@ -19,17 +19,18 @@
  */
 
 #pragma once
+
 #include <stdlib.h>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
 #include "gpu_config.h"
 #include "gpu_hash.h"
-#include "gpu_stream.hpp"
 #include "dgraph.hpp"
 #include "rdf_meta.hpp"
 #include "shard_manager.hpp"
 #include "unit.hpp"
+#include "gpu_stream.hpp"
 
 using namespace std;
 
@@ -60,13 +61,17 @@ const string fg_null("");
         cout << fg_yellow << indent << #name<<" time: " \
               << fg_red << end_##name-start_##name \
               << fg_yellow << " us" << fg_reset << endl;
- 
 
+
+class DGraph;
+class ShardManager;
+struct vertex_t;
+struct edge_t;
+struct ikey_t;
 
 class RCache {
 
 public:
-
     //kv store on sysmem
     vertex_t* vertex_addr;
     edge_t* edge_addr;
@@ -79,11 +84,11 @@ public:
     edge_t* d_edge_addr;
 
     //draft memory
-    int* d_result_table; 
-    int* d_updated_result_table; 
-    ikey_t* d_key_list; 
-    uint64_t* d_slot_id_list; 
-    int* d_index_list; 
+    int* d_result_table;
+    int* d_updated_result_table;
+    ikey_t* d_key_list;
+    uint64_t* d_slot_id_list;
+    int* d_index_list;
     int* d_index_list_mirror; // number of edges of key
     uint64_t* d_off_list;     // edges offset of key on GPU
     uint64_t* d_vertex_headers;
@@ -95,8 +100,7 @@ public:
 
     StreamPool* streamPool;
 
-    //streaming
-    // vector<cudaStream_t> streams;
+    // streaming
     cudaStream_t D2H_stream;
     vector<cudaEvent_t> events_compute;
 
@@ -108,7 +112,7 @@ public:
     vector<pred_meta_t> pred_metas;
 
     RCache(int devid, DGraph* graph, StreamPool* streamPool, int sid)
-		: devid(devid), dgraph(graph), streamPool(streamPool), sid(sid) {
+            : devid(devid), dgraph(graph), streamPool(streamPool), sid(sid) {
 
 
         vertex_addr = dgraph->gstore.get_vertices_ptr();
@@ -117,6 +121,16 @@ public:
         num_gpu_buckets = num_gpu_slots/ASSOCIATIVITY;
         num_gpu_entries =  (GiB2B(global_gpu_memstore_size_gb) - num_gpu_slots * sizeof(vertex_t)) / sizeof(edge_t);
         pred_metas = dgraph->gstore.get_pred_metas();
+
+
+
+        GPU_Config::vertex_frame_num_buckets = MiB2B(global_gpu_vertex_frame_size_mb) / (sizeof(vertex_t) * ASSOCIATIVITY);
+        GPU_Config::edge_frame_num_entries = MiB2B(global_gpu_edge_frame_size_mb) / sizeof(edge_t);
+        GPU_Config::gcache_num_vertex_frames = num_gpu_buckets / GPU_Config::vertex_frame_num_buckets;
+        GPU_Config::gcache_num_edge_frames = num_gpu_entries / GPU_Config::edge_frame_num_entries;
+
+
+
 
         //migrate kv store from sysmem to gpumem
         const uint64_t vertex_array_size = sizeof(vertex_t)*dgraph->gstore.get_num_slots();
@@ -137,8 +151,8 @@ public:
         CUDA_SAFE_CALL(cudaMalloc( (void**)&d_index_list, GPU_BUF_SIZE(sizeof(int)) ));
         CUDA_SAFE_CALL(cudaMalloc( (void**)&d_index_list_mirror, GPU_BUF_SIZE(sizeof(int)) ));
         CUDA_SAFE_CALL(cudaMalloc( (void**)&d_off_list, GPU_BUF_SIZE(sizeof(uint64_t)) ));
-        CUDA_SAFE_CALL(cudaMalloc( (void**)&d_vertex_headers, sizeof(uint64_t)* NGPU_SHARDS));
-        CUDA_SAFE_CALL(cudaMalloc( (void**)&d_edge_headers, sizeof(uint64_t)* NGPU_SHARDS));
+        CUDA_SAFE_CALL(cudaMalloc( (void**)&d_vertex_headers, sizeof(uint64_t)* GPU_Config::gcache_num_vertex_frames));
+        CUDA_SAFE_CALL(cudaMalloc( (void**)&d_edge_headers, sizeof(uint64_t)* GPU_Config::gcache_num_edge_frames));
 
         CUDA_SAFE_CALL(cudaMemset( d_result_table, 0, GPU_BUF_SIZE(sizeof(int)) ));
         CUDA_SAFE_CALL(cudaMemset( d_updated_result_table, 0, GPU_BUF_SIZE(sizeof(int)) ));
@@ -147,15 +161,13 @@ public:
         CUDA_SAFE_CALL(cudaMemset( d_index_list,0, GPU_BUF_SIZE(sizeof(int)) ));
         CUDA_SAFE_CALL(cudaMemset( d_index_list_mirror,0, GPU_BUF_SIZE(sizeof(int)) ));
         CUDA_SAFE_CALL(cudaMemset( d_off_list, 0, GPU_BUF_SIZE(sizeof(uint64_t)) ));
-        CUDA_SAFE_CALL(cudaMemset( d_vertex_headers, 0, sizeof(uint64_t) * NGPU_SHARDS));
-        CUDA_SAFE_CALL(cudaMemset( d_edge_headers, 0, sizeof(uint64_t) * NGPU_SHARDS));
+        CUDA_SAFE_CALL(cudaMemset( d_vertex_headers, 0, sizeof(uint64_t) * GPU_Config::gcache_num_vertex_frames));
+        CUDA_SAFE_CALL(cudaMemset( d_edge_headers, 0, sizeof(uint64_t) * GPU_Config::gcache_num_edge_frames));
 
         //load meta data info
         int predicate_num = dgraph->gstore.get_num_preds() + 1;
 
-#ifdef WUKONG_DEBUG
-        printf("[INFO#%d] RCache: predicate_num=%d\n", sid, predicate_num);
-#endif
+        printf("[INFO#%d] RCache: #predicates: %d\n", sid, predicate_num);
         CUDA_SAFE_CALL(cudaMalloc( (void**)&d_pred_metas, sizeof(pred_meta_t)*predicate_num )); 
         CUDA_SAFE_CALL(cudaMemcpy( d_pred_metas,
                                    &(pred_metas[0]),
@@ -207,12 +219,15 @@ public:
         CUDA_SAFE_CALL( cudaDeviceSynchronize() );
 
     }
-    ~RCache(){
+
+    ~RCache() {
         delete shardmanager;
     }
 
-    void const_to_unknown(){
-    };
+
+    void const_to_unknown() {
+
+    }
 
     vector<int> known_to_unknown(request_or_reply &req,int start,int direction,int predict) {
         //cout <<  "predict:"<<predict<<endl;
@@ -226,23 +241,22 @@ public:
 
         if (query_size==0) {
             //give buffer back to pool
-            if (req.gpu_history_table_ptr!=nullptr)
-                d_result_table = (int*)req.gpu_history_table_ptr;
+            if (req.gpu_history_ptr!=nullptr)
+                d_result_table = (int*)req.gpu_history_ptr;
 
-            req.gpu_history_table_ptr = nullptr;
+            req.gpu_history_ptr = nullptr;
             req.gpu_history_table_size = 0;
             return vector<int> ();
         }
 
-
         if(!req.is_first_handler()) {
-            d_result_table = (int*)req.gpu_history_table_ptr;
+
+            d_result_table = (int*)req.gpu_history_ptr;
         }
         else {
-            CUDA_SAFE_CALL(cudaMemcpy(d_result_table,
-                          raw_result_table,
-                          sizeof(int) * req.result_table.size(),
-                          cudaMemcpyHostToDevice));
+            // Siyuan: 如果执行的是第一条pattern，那么在进入handler之前
+            // 就应该已经把history拷贝到GPU上了，不该进入这个分支
+            assert(false);
         }
         assert(d_result_table!=d_updated_result_table); 
         assert(d_result_table!=nullptr); 
@@ -254,7 +268,6 @@ public:
             shardmanager->load_predicate(predict,predict,req, stream, false);
 
         t2 = timer::get_usec();
-
 
 
         //preload next
@@ -297,8 +310,8 @@ public:
                               d_key_list,
                               query_size,
                               stream);
-        t4 = timer::get_usec();
 #ifdef BREAK_DOWN
+        t4 = timer::get_usec();
         printf("[INFO#%d] known_to_unknown: generate_key_list_k2u() %luus\n", sid, t4 - t3);
 
         t3 = timer::get_usec();
@@ -311,9 +324,9 @@ public:
                       pred_vertex_shard_size,
                       query_size,
                       stream);
-        t4 = timer::get_usec();
 
 #ifdef BREAK_DOWN
+        t4 = timer::get_usec();
         printf("[INFO#%d] known_to_unknown: get_slot_id_list() %luus\n", sid, t4 - t3);
 
         t3 = timer::get_usec();
@@ -359,24 +372,22 @@ public:
 #ifdef BREAK_DOWN
         t4 = timer::get_usec();
         printf("[INFO#%d] known_to_unknown: update_result_table_k2u() %luus\n", sid, t4 - t3);
+        t3 = timer::get_usec();
 #endif
-
 
         //sync to get result
         CUDA_SAFE_CALL( cudaStreamSynchronize(stream) );
 
+
+#ifdef BREAK_DOWN
         t4 = timer::get_usec();
-
-#ifdef PIPELINE
-        printf(">>>> [known_to_unknown] step=%d, pid=%d, load time=%lluus, compute time=%lluus\n", req.step + 1, predict, t2-t1, t4-t3);
+        printf(">>>> [known_to_unknown] step=%d, pid=%d, load time=%lluus, sync_time=%lluus\n", req.step + 1, predict, t2-t1, t4-t3);
 #endif
-
-
 
         vector<int> updated_result_table;
         // printf("[INFO#%d] known_to_unknown: table_size=%d, row=%d, col=%d step=%d\n", sid, table_size, req.get_row_num(), req.get_col_num(), req.step + 1);
         if (!req.is_last_handler()) {
-            req.gpu_history_table_ptr = (char*)d_updated_result_table;
+            req.gpu_history_ptr = (char*)d_updated_result_table;
             req.gpu_history_table_size = table_size;
 
             if (req.gpu_origin_buffer_head != nullptr)
@@ -388,19 +399,22 @@ public:
                 d_updated_result_table = d_result_table;
 
         } else {
-            CUDA_SAFE_CALL(cudaMemcpy(h_result_table_buffer,
+            CUDA_SAFE_CALL(cudaMemcpyAsync(h_result_table_buffer,
                                   d_updated_result_table,
                                   sizeof(int) * table_size,
-                                  cudaMemcpyDeviceToHost));
+                                  cudaMemcpyDeviceToHost, stream));
+
+            cudaStreamSynchronize(stream);
             updated_result_table = vector<int>(h_result_table_buffer, h_result_table_buffer + table_size);
 
-            req.gpu_history_table_ptr = nullptr;
+            req.gpu_history_ptr = nullptr;
             req.gpu_history_table_size = 0;
         }
         return updated_result_table;
-    };
+    }
 
-    vector<int> known_to_known(request_or_reply &req,int start,int direction,int predict, int end){
+
+    vector<int> known_to_known(request_or_reply &req,int start,int direction,int predict, int end) {
         //cout <<  "predict:"<<predict<<endl;
         //load_predicate_wrapper(predict);
 
@@ -413,10 +427,10 @@ public:
         if(query_size==0)
         {
             //give buffer back to pool
-            if (req.gpu_history_table_ptr!=nullptr)
-                d_result_table = (int*)req.gpu_history_table_ptr;
+            if (req.gpu_history_ptr!=nullptr)
+                d_result_table = (int*)req.gpu_history_ptr;
 
-            req.gpu_history_table_ptr = nullptr;
+            req.gpu_history_ptr = nullptr;
             req.gpu_history_table_size = 0;
             return vector<int> ();
         }
@@ -424,10 +438,11 @@ public:
 
         if(!req.is_first_handler())
         {
-            d_result_table = (int*)req.gpu_history_table_ptr;
+            d_result_table = (int*)req.gpu_history_ptr;
         }
         else
         {
+            assert(false);
             CUDA_SAFE_CALL(cudaMemcpy(d_result_table,
                           raw_result_table,
                           sizeof(int) * req.result_table.size(),
@@ -470,7 +485,9 @@ public:
                           cudaMemcpyHostToDevice,
                           stream));
 
+#ifdef BREAK_DOWN
         t3 = timer::get_usec();
+#endif
 
         generate_key_list_k2u(d_result_table,
                               start,
@@ -481,6 +498,13 @@ public:
                               query_size,
                               stream) ;
 
+#ifdef BREAK_DOWN
+        t4 = timer::get_usec();
+        printf("[INFO#%d] known_to_known: generate_key_list_k2u() %luus\n", sid, t4 - t3);
+
+        t3 = timer::get_usec();
+#endif
+
         get_slot_id_list(d_vertex_addr,
                       d_key_list,
                       d_slot_id_list,
@@ -489,6 +513,13 @@ public:
                       pred_vertex_shard_size,
                       query_size,
                       stream);
+
+#ifdef BREAK_DOWN
+        t4 = timer::get_usec();
+        printf("[INFO#%d] known_to_known: get_slot_id_list() %luus\n", sid, t4 - t3);
+
+        t3 = timer::get_usec();
+#endif
 
         get_edge_list_k2k(d_slot_id_list,
                       d_vertex_addr,
@@ -505,10 +536,25 @@ public:
                       pred_edge_shard_size,
                       stream);
 
+#ifdef BREAK_DOWN
+        t4 = timer::get_usec();
+        printf("[INFO#%d] known_to_known: get_edge_list_k2k() %luus\n", sid, t4 - t3);
+
+        t3 = timer::get_usec();
+#endif
+
+
         calc_prefix_sum(d_index_list,
                         d_index_list_mirror,
                         query_size,
                         stream);
+
+#ifdef BREAK_DOWN
+        t4 = timer::get_usec();
+        printf("[INFO#%d] known_to_known: calc_prefix_sum() %luus\n", sid, t4 - t3);
+
+        t3 = timer::get_usec();
+#endif
 
         int table_size = update_result_table_k2k(d_result_table,
                                                            d_updated_result_table,
@@ -520,19 +566,26 @@ public:
                                                            query_size,
                                                            stream);
 
+#ifdef BREAK_DOWN
+        t4 = timer::get_usec();
+        printf("[INFO#%d] known_to_known: update_result_table_k2k() %luus\n", sid, t4 - t3);
+
+        t3 = timer::get_usec();
+#endif
+
         //sync to get result
         CUDA_SAFE_CALL( cudaStreamSynchronize(stream) );
 
-        t4 = timer::get_usec();
 
 #ifdef PIPELINE
-        printf(">>>> [known_to_known] step=%d, pid=%d, load time=%lluus, compute time=%lluus\n", req.step + 1, predict, t2-t1, t4-t3);
+        t4 = timer::get_usec();
+        printf(">>>> [known_to_known] step=%d, pid=%d, load time=%lluus, sync_time=%lluus\n", req.step + 1, predict, t2-t1, t4-t3);
 #endif
 
         vector<int> updated_result_table;
         if(!req.is_last_handler())
         {
-            req.gpu_history_table_ptr = (char*)d_updated_result_table;
+            req.gpu_history_ptr = (char*)d_updated_result_table;
             req.gpu_history_table_size = table_size;
 
             if (req.gpu_origin_buffer_head != nullptr)
@@ -545,20 +598,20 @@ public:
         }
         else
         {
-            CUDA_SAFE_CALL(cudaMemcpy(h_result_table_buffer,
+            CUDA_SAFE_CALL(cudaMemcpyAsync(h_result_table_buffer,
                                   d_updated_result_table,
                                   sizeof(int) * table_size,
-                                  cudaMemcpyDeviceToHost));
+                                  cudaMemcpyDeviceToHost, stream));
+            cudaStreamSynchronize(stream);
             updated_result_table = vector<int>(h_result_table_buffer, h_result_table_buffer + table_size);
-            req.gpu_history_table_ptr = nullptr;
+            req.gpu_history_ptr = nullptr;
             req.gpu_history_table_size = 0;
         }
 
-
         return updated_result_table;
-    };
+    }
 
-     vector<int> known_to_const(request_or_reply &req,int start,int direction,int predict, int end) {
+    vector<int> known_to_const(request_or_reply &req,int start,int direction,int predict, int end) {
         //cout <<  "predict:"<<predict<<endl;
         //load_predicate_wrapper(predict);
         cudaStream_t stream = streamPool->get_stream(predict);
@@ -571,10 +624,10 @@ public:
         if(query_size==0)
         {
             //give buffer back to pool
-            if (req.gpu_history_table_ptr!=nullptr)
-                d_result_table = (int*)req.gpu_history_table_ptr;
+            if (req.gpu_history_ptr!=nullptr)
+                d_result_table = (int*)req.gpu_history_ptr;
 
-            req.gpu_history_table_ptr = nullptr;
+            req.gpu_history_ptr = nullptr;
             req.gpu_history_table_size = 0;
             return vector<int> ();
         }
@@ -582,10 +635,11 @@ public:
 
         if(!req.is_first_handler())
         {
-            d_result_table = (int*)req.gpu_history_table_ptr;
+            d_result_table = (int*)req.gpu_history_ptr;
         }
         else
         {
+            assert(false);
             CUDA_SAFE_CALL(cudaMemcpy(d_result_table,
                           raw_result_table,
                           sizeof(int) * req.result_table.size(),
@@ -630,7 +684,9 @@ public:
                           cudaMemcpyHostToDevice,
                           stream));
 
+#ifdef BREAK_DOWN
         t3 = timer::get_usec();
+#endif
 
         generate_key_list_k2u(d_result_table,
                               start,
@@ -640,6 +696,12 @@ public:
                               d_key_list,
                               query_size,
                               stream);
+#ifdef BREAK_DOWN
+        t4 = timer::get_usec();
+        printf("[INFO#%d] known_to_const: generate_key_list_k2u() %luus\n", sid, t4 - t3);
+
+        t3 = timer::get_usec();
+#endif
 
         get_slot_id_list(d_vertex_addr,
                       d_key_list,
@@ -649,6 +711,15 @@ public:
                       pred_vertex_shard_size,
                       query_size,
                       stream);
+
+
+#ifdef BREAK_DOWN
+        t4 = timer::get_usec();
+        printf("[INFO#%d] known_to_const: get_slot_id_list() %luus\n", sid, t4 - t3);
+
+        t3 = timer::get_usec();
+#endif
+
 
         get_edge_list_k2c(d_slot_id_list,
                       d_vertex_addr,
@@ -663,10 +734,24 @@ public:
                       pred_edge_shard_size,
                       stream);
 
+#ifdef BREAK_DOWN
+        t4 = timer::get_usec();
+        printf("[INFO#%d] known_to_const: get_edge_list_k2c() %luus\n", sid, t4 - t3);
+
+        t3 = timer::get_usec();
+#endif
+
         calc_prefix_sum(d_index_list,
                         d_index_list_mirror,
                         query_size,
                         stream);
+
+#ifdef BREAK_DOWN
+        t4 = timer::get_usec();
+        printf("[INFO#%d] known_to_const: calc_prefix_sum() %luus\n", sid, t4 - t3);
+
+        t3 = timer::get_usec();
+#endif
 
         int table_size = update_result_table_k2k(d_result_table,
                                                            d_updated_result_table,
@@ -677,19 +762,27 @@ public:
                                                            end,
                                                            query_size,
                                                            stream);
+
+#ifdef BREAK_DOWN
+        t4 = timer::get_usec();
+        printf("[INFO#%d] known_to_const: update_result_table_k2k() %luus\n", sid, t4 - t3);
+
+        t3 = timer::get_usec();
+#endif
+
         //sync to get result
         CUDA_SAFE_CALL( cudaStreamSynchronize(stream) );
 
-        t4 = timer::get_usec();
 
-#ifdef PIPELINE
+#ifdef BREAK_DOWN
+        t4 = timer::get_usec();
         printf(">>>> [known_to_const] step=%d, pid=%d, load time=%lluus, compute time=%lluus\n", req.step + 1, predict, t2-t1, t4-t3);
 #endif
 
         vector<int> updated_result_table;
         if(!req.is_last_handler())
         {
-            req.gpu_history_table_ptr = (char*)d_updated_result_table;
+            req.gpu_history_ptr = (char*)d_updated_result_table;
             req.gpu_history_table_size = table_size;
 
             if (req.gpu_origin_buffer_head != nullptr)
@@ -702,21 +795,21 @@ public:
         }
         else
         {
-            CUDA_SAFE_CALL(cudaMemcpy(h_result_table_buffer,
+            CUDA_SAFE_CALL(cudaMemcpyAsync(h_result_table_buffer,
                                   d_updated_result_table,
                                   sizeof(int) * table_size,
-                                  cudaMemcpyDeviceToHost));
+                                  cudaMemcpyDeviceToHost, stream));
+            cudaStreamSynchronize(stream);
             updated_result_table = vector<int>(h_result_table_buffer, h_result_table_buffer + table_size);
-            req.gpu_history_table_ptr = nullptr;
+            req.gpu_history_ptr = nullptr;
             req.gpu_history_table_size = 0;
         }
 
         return updated_result_table;
-    };
+    }
 
     vector<int> index_to_unknown(request_or_reply &req, int index_vertex, int direction) {
         //cout << "index_vertex:"<<index_vertex<<endl;
-        //load_predicate_wrapper(index_vertex);
         uint64_t t1, t2, t3, t4;
         int query_size = 1;
         cudaStream_t stream = streamPool->get_stream(index_vertex);
@@ -724,7 +817,7 @@ public:
         // printf("[INFO#%d] index_to_unknown: query_size=%d, step=%d\n", sid, query_size, req.step);
 
         if (!req.is_first_handler()) {
-            d_result_table = (int*)req.gpu_history_table_ptr;
+            d_result_table = (int*)req.gpu_history_ptr;
         }
 
         assert(d_result_table!=d_updated_result_table);
@@ -740,9 +833,6 @@ public:
         //preload next
         if(global_gpu_enable_pipeline)
         {
-            //for(auto pred:req.preds)
-            //    if(!shardmanager->check_pred_exist(pred))
-            //        shardmanager->load_predicate(req.preds[pred],req.preds,streams[req.preds[pred]]);
             while(!req.preds.empty() && shardmanager->check_pred_exist(req.preds[0]))
             {
                 req.preds.erase(req.preds.begin());
@@ -789,9 +879,9 @@ public:
                       pred_vertex_shard_size,
                       query_size,
                       stream);
-        t4 = timer::get_usec();
 
 #ifdef BREAK_DOWN
+        t4 = timer::get_usec();
         printf("[INFO#%d] index_to_unknown: get_slot_id_list() %luus\n", sid, t4 - t3);
 
         t3 = timer::get_usec();
@@ -853,28 +943,29 @@ public:
         // Siyuan: 如果不是最后一个handler
         if(!req.is_last_handler())
         {
-            req.gpu_history_table_ptr = (char*)d_updated_result_table;
+            req.gpu_history_ptr = (char*)d_updated_result_table;
             req.gpu_history_table_size = table_size;
             d_updated_result_table = d_result_table;
         }
         else
         {   // 若是最后一个handler
-            CUDA_SAFE_CALL(cudaMemcpy(h_result_table_buffer,
+            CUDA_SAFE_CALL(cudaMemcpyAsync(h_result_table_buffer,
                                   d_updated_result_table,
                                   sizeof(int) * table_size,
-                                  cudaMemcpyDeviceToHost));
+                                  cudaMemcpyDeviceToHost, stream));
+            cudaStreamSynchronize(stream);
             updated_result_table = vector<int>(h_result_table_buffer, h_result_table_buffer + table_size);
-            req.gpu_history_table_ptr = nullptr;
+            req.gpu_history_ptr = nullptr;
             req.gpu_history_table_size = 0;
         }
         return updated_result_table;
-    };
+    }
 
     void generate_sub_query(request_or_reply &req,
-                            int start,
-                            int num_sub_request,
-                            int** gpu_sub_table_ptr_list,
-                            int* gpu_sub_table_size_list ) {
+                                int start,
+                                int num_sub_request,
+                                int** gpu_sub_table_ptr_list,
+                                int* gpu_sub_table_size_list ) {
         // int* raw_result_table = &req.result_table[0];
         int query_size = req.get_row_num();
 
@@ -883,7 +974,7 @@ public:
 
         // Siyuan: 如果不是第一个handler
         if (!req.is_first_handler()) {
-            d_result_table = (int*)req.gpu_history_table_ptr;
+            d_result_table = (int*)req.gpu_history_ptr;
         } else {
             assert(false);
         }
@@ -949,6 +1040,6 @@ public:
          * } else {
          *     assert(false);
          * } */
-    };
+    }
 
 };

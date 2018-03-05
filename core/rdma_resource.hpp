@@ -43,10 +43,28 @@
 
 #include "timer.hpp"
 
-#define GPU_QP_IDX(id) (id + global_num_proxies + global_num_engines)
+// #define GPU_QP_IDX(id) (id + global_num_proxies + global_num_engines)
 
 
-#ifdef HAS_RDMA
+enum MemTypes { GPU_DRAM = 1, CPU_DRAM };
+
+struct rdma_mem_t {
+    enum MemTypes src;
+    enum MemTypes dst;
+    // uint64_t local_off;
+    uint64_t remote_off;
+
+    rdma_mem_t() { remote_off = 0xdeadbeef; }
+    rdma_mem_t(enum MemTypes src, enum MemTypes dst)
+        : src(src), dst(dst)
+    { remote_off = 0xdeadbeef; }
+};
+
+#define RDMA_MEM_H2H rdma_mem_t(CPU_DRAM, CPU_DRAM)
+#define RDMA_MEM_D2D rdma_mem_t(GPU_DRAM, GPU_DRAM)
+#define RDMA_MEM_D2H rdma_mem_t(GPU_DRAM, CPU_DRAM)
+#define RDMA_MEM_H2D rdma_mem_t(CPU_DRAM, GPU_DRAM)
+
 
 struct config_t {
     char dev_name[12];         /* IB device name */
@@ -107,7 +125,7 @@ struct normal_op_req {
 };
 
 struct config_t rdma_config = {
-    "mlx5_0",                         /* dev_name */
+    "mlx4_0",                         /* dev_name */
     NULL,                         /* server_name */
     19875,                        /* tcp_port */
     1,                            /* ib_port */
@@ -129,7 +147,6 @@ static inline uint64_t ntohll(uint64_t x) { return x; }
 #error __BYTE_ORDER is neither __LITTLE_ENDIAN nor __BIG_ENDIAN
 
 #endif
-
 
 static void dev_resources_init(struct dev_resource *res) {
     memset(res, 0, sizeof * res);
@@ -365,6 +382,9 @@ static struct cm_con_data_t get_local_con_data(struct QP *res) {
     local_con_data.rkey[0] = htonl (res->mr_cpu->rkey);
     local_con_data.rkey[1] = htonl (res->mr_gpu->rkey);
 
+    // printf("cpu rkey=%x, gpu rkey=%x\n", res->mr_cpu->rkey, res->mr_gpu->rkey);
+
+
     /* local_con_data.addr = htonll((uintptr_t)(res->dev->buf));
      * local_con_data.rkey = htonl(res->mr->rkey); */
     local_con_data.qp_num = htonl(res->qp->qp_num);
@@ -511,7 +531,7 @@ connect_qp_exit:
     return rc;
 }
 
-static int post_send(struct QP *res, ibv_wr_opcode opcode, char *local_buf, size_t size, size_t remote_offset, bool signal, bool gdr) {
+static int post_send(struct QP *res, ibv_wr_opcode opcode, char *local_buf, size_t size, size_t remote_offset, bool signal, rdma_mem_t rdma_mem) {
     struct ibv_send_wr sr;
     struct ibv_sge sge;
     struct ibv_send_wr *bad_wr = NULL;
@@ -520,7 +540,19 @@ static int post_send(struct QP *res, ibv_wr_opcode opcode, char *local_buf, size
     memset (&sge, 0, sizeof (sge));
     sge.addr = (uintptr_t) local_buf;
     sge.length = size;
-    sge.lkey = (gdr ? res->mr_gpu->lkey : res->mr_cpu->lkey);
+    switch (opcode) {
+        case IBV_WR_RDMA_WRITE:
+            sge.lkey = (rdma_mem.src == GPU_DRAM ? res->mr_gpu->lkey : res->mr_cpu->lkey);
+            break;
+        case IBV_WR_RDMA_READ:
+            sge.lkey = (rdma_mem.dst == GPU_DRAM ? res->mr_gpu->lkey : res->mr_cpu->lkey);
+
+            break;
+        default:
+            fprintf(stderr, "unknown RDMA opcode!\n");
+
+    }
+
     /* prepare the send work request */
     memset (&sr, 0, sizeof (sr));
     sr.next = NULL;
@@ -535,21 +567,35 @@ static int post_send(struct QP *res, ibv_wr_opcode opcode, char *local_buf, size
         sr.send_flags = 0;
 
     if (opcode != IBV_WR_SEND) {
-        // if is GPUDirect RDMA, use parameters for GPU MR
-        if (gdr) {
-            sr.wr.rdma.remote_addr = res->remote_props.addr[1] + remote_offset;
-            sr.wr.rdma.rkey = res->remote_props.rkey[1];
-        } else {
-            sr.wr.rdma.remote_addr = res->remote_props.addr[0] + remote_offset;
-            sr.wr.rdma.rkey = res->remote_props.rkey[0];
+        if (opcode == IBV_WR_RDMA_WRITE) {
+            if (rdma_mem.dst == CPU_DRAM) {
+              sr.wr.rdma.remote_addr = res->remote_props.addr[0] + remote_offset;
+              sr.wr.rdma.rkey = res->remote_props.rkey[0];
+            } else {
+              sr.wr.rdma.remote_addr = res->remote_props.addr[1] + remote_offset;
+              sr.wr.rdma.rkey = res->remote_props.rkey[1];
+            }
         }
+
+        if (opcode == IBV_WR_RDMA_READ) {
+            if (rdma_mem.src == CPU_DRAM) {
+              sr.wr.rdma.remote_addr = res->remote_props.addr[0] + remote_offset;
+              sr.wr.rdma.rkey = res->remote_props.rkey[0];
+            } else {
+              sr.wr.rdma.remote_addr = res->remote_props.addr[1] + remote_offset;
+              sr.wr.rdma.rkey = res->remote_props.rkey[1];
+            }
+        }
+
     }
+
+    // printf("DEBUG: lkey=%x, rkey=%x, dst_mem=%d\n", sge.lkey, sr.wr.rdma.rkey, rdma_mem.dst);
 
     /* there is a Receive Request in the responder side,
     so we won't get any into RNR flow */
     rc = ibv_post_send(res->qp, &sr, &bad_wr);
     if (rc)
-        fprintf (stderr, "failed to post SR\n");
+        fprintf (stderr, "failed to post SR, rc=%d\n", rc);
     else {
         /*
         switch (opcode)
@@ -683,18 +729,21 @@ class RDMA {
          * @dst_tid starts from 0
          */
         int gpuRdmaOp(int dst_tid, int dst_nid, char *buf, uint64_t size,
-                   uint64_t off, ibv_wr_opcode op) {
+                   uint64_t off, ibv_wr_opcode op, rdma_mem_t rdma_mem) {
 
-            assert(dst_tid < global_num_gpu_engines);
-            assert(off < gpu_mem_sz);
+            assert(global_num_proxies < dst_tid && dst_tid < global_num_threads);
             assert(dst_nid < num_nodes);
+            if (rdma_mem.dst == GPU_DRAM)
+                assert(off < gpu_mem_sz);
+            else
+                assert(off < cpu_mem_sz);
 
-            if (post_send(res[GPU_QP_IDX(dst_tid)] + dst_nid, op, buf, size, off, true, true)) {
+            if (post_send(res[dst_tid] + dst_nid, op, buf, size, off, true, rdma_mem)) {
                 cout << "GPU RDMA: failed to post request!" << endl;
                 assert(false);
             }
 
-            if (poll_completion(res[GPU_QP_IDX(dst_tid)] + dst_nid)) {
+            if (poll_completion(res[dst_tid] + dst_nid)) {
                 cout << "GPU RDMA: poll completion failed!" << endl;
                 assert(false);
             }
@@ -708,7 +757,7 @@ class RDMA {
             assert(dst_nid < num_nodes);
             assert(dst_tid < num_threads);
 
-            if (post_send(res[dst_tid] + dst_nid, op, buf, size, off, true, false)) {
+            if (post_send(res[dst_tid] + dst_nid, op, buf, size, off, true, RDMA_MEM_H2H)) {
                 cout << "ERROR: failed to post request!" << endl;
                 assert(false);
             }
@@ -731,7 +780,7 @@ class RDMA {
             uint64_t sum = 0;
 
             for (int i = 0; i < BATCH_FACTOR; i++) {
-                if (post_send(res[dst_tid] + dst_nid, op, buf, size, off, true, false) ) {
+                if (post_send(res[dst_tid] + dst_nid, op, buf, size, off, true, RDMA_MEM_H2H) ) {
                     fprintf(stderr, "failed to post request.");
                     assert(false);
                 }
@@ -862,11 +911,11 @@ class RDMA {
         string ip_of(int sid) { return ipset[sid]; }
 
         int GPURdmaRead(int dst_tid, int dst_nid, char *local, uint64_t size, uint64_t off) {
-            return gpuRdmaOp(dst_tid, dst_nid, local, size, off, IBV_WR_RDMA_READ);
+            return gpuRdmaOp(dst_tid, dst_nid, local, size, off, IBV_WR_RDMA_READ, RDMA_MEM_D2D);
         }
 
-        int GPURdmaWrite(int dst_tid, int dst_nid, char *local, uint64_t size, uint64_t off) {
-            return gpuRdmaOp(dst_tid, dst_nid, local, size, off, IBV_WR_RDMA_WRITE);
+        int GPURdmaWrite(int dst_tid, int dst_nid, char *local, uint64_t size, uint64_t off, rdma_mem_t rdma_mem) {
+            return gpuRdmaOp(dst_tid, dst_nid, local, size, off, IBV_WR_RDMA_WRITE, rdma_mem);
         }
 
 
@@ -986,85 +1035,4 @@ void RDMA_init(int num_nodes, int num_threads, int node_id,
     rdma.dev->connect();
 }
 
-#else
 
-class RDMA {
-    class RDMA_Device {
-    public:
-        RDMA_Device(int num_nodes, int num_threads, int node_id,
-                    string fname, char *mem, uint64_t mem_sz) {
-            cout << "This system is compiled without RDMA support." << endl;
-            assert(false);
-        }
-
-        void servicing() {
-            cout << "This system is compiled without RDMA support." << endl;
-            assert(false);
-        }
-
-        void connect() {
-            cout << "This system is compiled without RDMA support." << endl;
-            assert(false);
-        }
-
-        string ip_of(int sid) {
-            cout << "This system is compiled without RDMA support." << endl;
-            assert(false);
-            return string();
-        }
-
-        int RdmaRead(int dst_tid, int dst_nid, char *local,
-                     uint64_t size, uint64_t remote_offset) {
-            cout << "This system is compiled without RDMA support." << endl;
-            assert(false);
-            return 0;
-        }
-
-        int RdmaWrite(int dst_tid, int dst_nid, char *local,
-                      uint64_t size, uint64_t remote_offset) {
-            cout << "This system is compiled without RDMA support." << endl;
-            assert(false);
-            return 0;
-        }
-
-        int RdmaCmpSwap(int dst_tid, int dst_nid, char *local,
-                        uint64_t compare, uint64_t swap,
-                        uint64_t size, uint64_t off) {
-            cout << "This system is compiled without RDMA support." << endl;
-            assert(false);
-            return 0;
-        }
-    }; // end of class RdmaResource
-
-public:
-    RDMA_Device *dev = NULL;
-
-    RDMA() {
-        std::cout << "This system is compiled without RDMA support."
-                  << std::endl;
-    }
-
-    ~RDMA() { }
-
-    void init_dev(int num_nodes, int num_threads, int node_id,
-                  char *mem, uint64_t mem_sz, string ipfn) {
-        std::cout << "This system is compiled without RDMA support."
-                  << std::endl;
-    }
-
-    inline static bool has_rdma() { return false; }
-
-    static RDMA &get_rdma() {
-        static RDMA rdma;
-        return rdma;
-    }
-
-};
-
-void RDMA_init(int num_nodes, int num_threads, int node_id,
-               char *mem, uint64_t mem_sz, string ipfn) {
-    std::cout << "This system is compiled without RDMA support."
-              << std::endl;
-}
-
-#endif 

@@ -22,6 +22,7 @@
 #include <boost/unordered_set.hpp>
 #include <boost/unordered_map.hpp>
 #include <stdlib.h> //qsort
+#include <list>
 
 #include "config.hpp"
 #include "coder.hpp"
@@ -31,63 +32,10 @@
 
 #include "mymath.hpp"
 #include "timer.hpp"
+#include "reply_map.hpp"
 
 using namespace std;
 
-// The map is used to colloect the replies of sub-queries in fork-join execution
-class Reply_Map {
-private:
-
-    struct Item {
-        int count;
-        request_or_reply parent_request;
-        request_or_reply merged_reply;
-    };
-
-    boost::unordered_map<int, Item> internal_item_map;
-
-public:
-    void put_parent_request(request_or_reply &r, int cnt) {
-        Item data;
-        data.count = cnt;
-        data.parent_request = r;
-        internal_item_map[r.id] = data;
-    }
-
-    void put_reply(request_or_reply &r) {
-        int pid = r.pid;
-        Item &data = internal_item_map[pid];
-
-        vector<int> &result_table = data.merged_reply.result_table;
-        data.count--;
-        data.merged_reply.step = r.step;
-        data.merged_reply.col_num = r.col_num;
-        data.merged_reply.blind = r.blind;
-        data.merged_reply.row_num += r.row_num;
-
-        int new_size = result_table.size() + r.result_table.size();
-        result_table.reserve(new_size);
-        result_table.insert( result_table.end(), r.result_table.begin(), r.result_table.end());
-    }
-
-    bool is_ready(int pid) {
-        return internal_item_map[pid].count == 0;
-    }
-
-    request_or_reply get_merged_reply(int pid) {
-        request_or_reply r = internal_item_map[pid].parent_request;
-        request_or_reply &merged_reply = internal_item_map[pid].merged_reply;
-
-        r.step = merged_reply.step;
-        r.col_num = merged_reply.col_num;
-        r.blind = merged_reply.blind;
-        r.row_num = merged_reply.row_num;
-
-        r.result_table.swap(merged_reply.result_table);
-        internal_item_map.erase(pid);
-        return r;
-    }
-};
 
 typedef pair<int64_t, int64_t> v_pair;
 
@@ -113,8 +61,43 @@ class Engine {
     Reply_Map rmap; // a map of replies for pending (fork-join) queries
     pthread_spinlock_t rmap_lock;
 
+    std::list<Pending_Msg> pending_msgs;
+
+    void sweep_msgs() {
+        if (pending_msgs.empty()) return;
+
+        bool success = false;
+        for (auto it = pending_msgs.begin(); it != pending_msgs.end(); ) {
+            assert(it->r.query_type == FULL_QUERY);
+
+            success = adaptor->send(it->sid, it->tid, it->r);
+
+            if (success) {
+                it = pending_msgs.erase(it);
+            } else {
+                it++;
+            }
+        }
+
+    }
+
+    void send_request(int dst_sid, int dst_tid, request_or_reply &r) {
+        bool success;
+        success = adaptor->send(dst_sid, dst_tid, r);
+
+        if (success) return;
+
+        // save to pending queue
+        pending_msgs.push_back(Pending_Msg(dst_sid, dst_tid, r));
+    }
+
+
     // all of these means const predicate
     void const_to_unknown(request_or_reply &req) {
+#ifdef QUERY_DEBUG
+        printf("Engine[%d:%d]:const_to_unknown(): [begin] reqid=%d, req_pid=%d, step=%d, table_size=%lu\n",
+                sid, tid, req.id, req.pid, req.step, req.result_table.size() );
+#endif
         int64_t start = req.cmd_chains[req.step * 4];
         int64_t pid   = req.cmd_chains[req.step * 4 + 1];
         int64_t d     = req.cmd_chains[req.step * 4 + 2];
@@ -132,11 +115,19 @@ class Engine {
         req.result_table.swap(updated_result_table);
         req.set_col_num(1);
         req.step++;
+#ifdef QUERY_DEBUG
+        printf("Engine[%d:%d]:const_to_unknown(): [end] reqid=%d, req_pid=%d, step=%d, table_size=%lu\n",
+                sid, tid, req.id, req.pid, req.step, req.result_table.size() );
+#endif
     }
 
     void const_to_known(request_or_reply &req) { assert(false); } /// TODO
 
     void known_to_unknown(request_or_reply &req) {
+#ifdef QUERY_DEBUG
+        printf("Engine[%d:%d]:known_to_unknown(): [begin] reqid=%d, req_pid=%d, step=%d, table_size=%lu\n",
+                sid, tid, req.id, req.pid, req.step, req.result_table.size() );
+#endif
         int64_t start = req.cmd_chains[req.step * 4];
         int64_t pid   = req.cmd_chains[req.step * 4 + 1];
         int64_t d     = req.cmd_chains[req.step * 4 + 2];
@@ -161,9 +152,19 @@ class Engine {
         req.set_col_num(req.get_col_num() + 1);
         req.result_table.swap(updated_result_table);
         req.step++;
+
+#ifdef QUERY_DEBUG
+        printf("Engine[%d:%d]:known_to_unknown(): [end] reqid=%d, req_pid=%d, step=%d, table_size=%lu\n",
+                sid, tid, req.id, req.pid, req.step, req.result_table.size() );
+#endif
     }
 
     void known_to_known(request_or_reply &req) {
+#ifdef QUERY_DEBUG
+        printf("Engine[%d:%d]:known_to_known(): [begin] reqid=%d, req_pid=%d, step=%d, table_size=%lu\n",
+                sid, tid, req.id, req.pid, req.step, req.result_table.size() );
+#endif
+
         int64_t start = req.cmd_chains[req.step * 4];
         int64_t pid   = req.cmd_chains[req.step * 4 + 1];
         int64_t d     = req.cmd_chains[req.step * 4 + 2];
@@ -185,9 +186,18 @@ class Engine {
 
         req.result_table.swap(updated_result_table);
         req.step++;
+
+#ifdef QUERY_DEBUG
+        printf("Engine[%d:%d]:known_to_known(): [end] reqid=%d, req_pid=%d, step=%d, table_size=%lu\n",
+                sid, tid, req.id, req.pid, req.step, req.result_table.size() );
+#endif
     }
 
     void known_to_const(request_or_reply &req) {
+#ifdef QUERY_DEBUG
+        printf("Engine[%d:%d]:known_to_const(): [begin] reqid=%d, req_pid=%d, step=%d, table_size=%lu\n",
+                sid, tid, req.id, req.pid, req.step, req.result_table.size() );
+#endif
         int64_t start = req.cmd_chains[req.step * 4];
         int64_t pid   = req.cmd_chains[req.step * 4 + 1];
         int64_t d     = req.cmd_chains[req.step * 4 + 2];
@@ -208,9 +218,17 @@ class Engine {
 
         req.result_table.swap(updated_result_table);
         req.step++;
+#ifdef QUERY_DEBUG
+        printf("Engine[%d:%d]:known_to_const(): [end] reqid=%d, req_pid=%d, step=%d, table_size=%lu\n",
+                sid, tid, req.id, req.pid, req.step, req.result_table.size() );
+#endif
     }
 
     void index_to_unknown(request_or_reply &req) {
+#ifdef QUERY_DEBUG
+        printf("Engine[%d:%d]:index_to_unknown(): [begin] reqid=%d, req_pid=%d, step=%d, table_size=%lu\n",
+                sid, tid, req.id, req.pid, req.step, req.result_table.size() );
+#endif
         int64_t idx = req.cmd_chains[req.step * 4];
         int64_t nothing = req.cmd_chains[req.step * 4 + 1];
         int64_t d = req.cmd_chains[req.step * 4 + 2];
@@ -230,6 +248,10 @@ class Engine {
         req.set_col_num(1);
         req.step++;
         req.local_var = -1;
+#ifdef QUERY_DEBUG
+        printf("Engine[%d:%d]:index_to_unknown(): [end] reqid=%d, req_pid=%d, step=%d, table_size=%lu\n",
+                sid, tid, req.id, req.pid, req.step, req.result_table.size() );
+#endif
     }
 
     void const_unknown_unknown(request_or_reply &req) {
@@ -549,6 +571,7 @@ class Engine {
 
     void execute_request(request_or_reply &req) {
         uint64_t t1, t2;
+        bool success;
 
         while (true) {
             t1 = timer::get_usec();
@@ -564,10 +587,13 @@ class Engine {
 
             if (req.is_finished()) {
                 req.row_num = req.get_row_num();
+                req.query_type = FULL_QUERY;
+
                 if (req.blind)
                     req.clear_data(); // avoid take back the resuts
 
-                adaptor->send(coder.sid_of(req.pid), coder.tid_of(req.pid), req);
+                assert(req.is_request() == false);
+                send_request(coder.sid_of(req.pid), coder.tid_of(req.pid), req);
                 return;
             }
 
@@ -576,7 +602,7 @@ class Engine {
                 rmap.put_parent_request(req, sub_rs.size());
                 for (int i = 0; i < sub_rs.size(); i++) {
                     if (i != sid) {
-                        adaptor->send(i, tid, sub_rs[i]);
+                        send_request(i, tid, sub_rs[i]);
                     } else {
                         pthread_spin_lock(&recv_lock);
                         msg_fast_path.push_back(sub_rs[i]);
@@ -590,6 +616,8 @@ class Engine {
     }
 
     void execute(request_or_reply &r, Engine *engine) {
+
+        bool success;
         if (r.is_request()) {
             // request
             r.id = coder.get_and_inc_qid();
@@ -601,7 +629,9 @@ class Engine {
             if (engine->rmap.is_ready(r.pid)) {
                 request_or_reply reply = engine->rmap.get_merged_reply(r.pid);
                 pthread_spin_unlock(&engine->rmap_lock);
-                adaptor->send(coder.sid_of(reply.pid), coder.tid_of(reply.pid), reply);
+                reply.query_type = FULL_QUERY;
+                assert(reply.is_request() == false);
+                send_request(coder.sid_of(reply.pid), coder.tid_of(reply.pid), reply);
             } else {
                 pthread_spin_unlock(&engine->rmap_lock);
             }
@@ -667,6 +697,9 @@ public:
                 success = false;
             }
             pthread_spin_unlock(&recv_lock);
+
+            // check and send pending messages
+            sweep_msgs();
 
             if (success) execute(r, engines[own_id]);
 

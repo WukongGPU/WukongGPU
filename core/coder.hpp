@@ -14,11 +14,15 @@
  *  express or implied.  See the License for the specific language
  *  governing permissions and limitations under the License.
  *
+ *
  */
 
 #pragma once
 
 #include <stdlib.h>
+
+extern int global_num_servers;
+extern int global_num_threads;
 
 using namespace std;
 

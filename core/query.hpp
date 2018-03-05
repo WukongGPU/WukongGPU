@@ -24,6 +24,8 @@
 #include <boost/serialization/string.hpp>
 #include <boost/serialization/vector.hpp>
 #include <vector>
+#include "defines.hpp"
+#include "gstore.hpp"
 
 using namespace std;
 using namespace boost::archive;
@@ -35,6 +37,7 @@ enum var_type {
 };
 
 enum comp_device {CPU_comp, GPU_comp};
+enum QueryTypes {FULL_QUERY, SPLIT_QUERY};
 
 // defined as constexpr due to switch-case
 constexpr int var_pair(int t1, int t2) { return ((t1 << 4) | t2); }
@@ -52,11 +55,12 @@ public:
     int row_num = 0;
 
     bool blind = false;
-    bool dummy = false;  // for mix-workload test
     bool sub_req = false;
 
-    comp_device comp_dev = CPU_comp;
-    char* gpu_history_table_ptr = nullptr; // pointer to history table on GPU
+    enum comp_device comp_dev = CPU_comp;
+    enum QueryTypes query_type = FULL_QUERY;
+
+    char* gpu_history_ptr = nullptr; // pointer to history table on GPU
     char* gpu_origin_buffer_head = nullptr;// to record origin buffer head for sub request
     int gpu_history_table_size = 0;
 
@@ -66,7 +70,6 @@ public:
     vector<int> preds;
 
     request_or_reply() { }
-    request_or_reply(bool dummy) { this->dummy = dummy; }
 
     request_or_reply(vector<int64_t> _cc): cmd_chains(_cc) { }
 
@@ -81,6 +84,7 @@ public:
         ar & blind;
         ar & sub_req;
         ar & comp_dev;
+        ar & query_type;
         ar & gpu_history_table_size;
         ar & local_var;
         ar & cmd_chains;
@@ -94,6 +98,22 @@ public:
 
     bool is_first_handler() { return (step==0); }
     bool is_last_handler() { return ((step+1) * 4 >= cmd_chains.size()); }
+
+    int *host_table_ptr() const {
+        return &result_table[0];
+    }
+
+    int host_table_size() const {
+        return result_table.size();
+    }
+
+    // for debug purpose
+    int get_table_size() const {
+        if (gpu_history_ptr)
+            return gpu_history_table_size;
+        else
+            return result_table.size();
+    }
 
     bool is_request() { return (id == -1); }
 
@@ -139,12 +159,12 @@ public:
 
     int get_row_num() {
         if (col_num == 0) return 0;
-        if(gpu_history_table_ptr!=nullptr)
+        if (gpu_history_ptr != nullptr)
             return gpu_history_table_size / col_num;
         return result_table.size() / col_num;
     }
 
-    int64_t get_row_col(int r, int c) {
+    int get_row_col(int r, int c) {
         return result_table[col_num * r + c];
     }
 
@@ -152,6 +172,17 @@ public:
         for (int c = 0; c < col_num; c++)
             updated_result_table.push_back(get_row_col(r, c));
     }
+};
+
+
+class Pending_Msg {
+public:
+    int sid;
+    int tid;
+    request_or_reply r;
+
+    Pending_Msg(int sid, int tid, request_or_reply &r)
+        : sid(sid), tid(tid), r(r) { }
 };
 
 class request_template {

@@ -14,6 +14,7 @@
  *  express or implied.  See the License for the specific language
  *  governing permissions and limitations under the License.
  *
+ *
  */
 
 #pragma once
@@ -32,7 +33,7 @@
 using namespace std;
 
 // communicate between proxy threads
-TCP_Adaptor *con_adaptor;
+TCP_Transport *con_adaptor;
 
 template<typename T>
 static void console_send(int sid, int tid, T &r) {
@@ -77,18 +78,26 @@ void print_help(void)
 	cout << "These are common Wukong commands: " << endl;
 	cout << "    help           Display help infomation" << endl;
 	cout << "    quit           Quit from console" << endl;
+    cout << "    stat-gdr       Print statistics of GPUDirect RDMA" << endl;
 	cout << "    reload-config  Reload config file" << endl;
 	cout << "    show-config    Show current config" << endl;
+    cout << "    run-script     Run commands in 'wukong.script' file" << endl;
 	cout << "    sparql         Run SPARQL queries" << endl;
 	cout << "        -f <file>   a single query from the <file>" << endl;
 	cout << "        -n <num>    run a single query <num> times" << endl;
-	cout << "        -b <file>   a set of queries configured by the <file>" << endl;
+	cout << "        -b <file> [<args>]  run queries configured by <file> (batch-mode)" << endl;
+	cout << "           -d <sec>            eval <sec> seconds" << endl;
+	cout << "           -w <sec>            warmup <sec> seconds" << endl;
+	cout << "           -i <msec>           sleep <msec> before sending next query" << endl;
+	cout << "           -p <num>            send <num> queries in parallel" << endl;
+
 	cout << "        -s <string> a single query from input string" << endl;
 }
 
 // the master proxy is the 1st proxy of the 1st server (i.e., sid == 0 and tid == 0)
 #define IS_MASTER(_p) ((_p)->sid == 0 && (_p)->tid == 0)
 #define PRINT_ID(_p) (cout << "[" << (_p)->sid << "-" << (_p)->tid << "]$ ")
+
 
 /**
  * The Wukong's console is co-located with the main proxy (the 1st proxy thread on the 1st server)
@@ -103,23 +112,33 @@ void run_console(Proxy *proxy)
 		     << endl
 		     << endl;
 
-    ifstream ifs("lubm_input");
-    if (!ifs) {
-        std::cout << "Open lubm_input fail" << endl;
-        assert(false);
-    }
+    // ifstream ifs("lubm_input");
+    // if (!ifs) {
+        // std::cout << "Open lubm_input fail" << endl;
+        // assert(false);
+    // }
+    ifstream file_script;
+    // Logger master_logger;
+    // logger每跑完一次就填充一下这些Figure所需的数据
+    Fig_Thpt_Latency fig_thpt_latency;
 
 	while (true) {
 		console_barrier(proxy->tid);
 next:
 		string cmd;
 		if (IS_MASTER(proxy)) {
+
 			cout << "> ";
             // read command from file first
-            if (!ifs.eof())
-                getline(ifs, cmd);
-            else
+            if (file_script.is_open() && !file_script.eof()) {
+                sleep(3);
+                getline(file_script, cmd);
+                cout << cmd << endl;;
+            } else {
+                if (file_script.is_open())
+                    file_script.close();
                 std::getline(std::cin, cmd);
+            }
 
 			// trim input
 			size_t pos = cmd.find_first_not_of(" \t"); // trim blanks from head
@@ -136,7 +155,10 @@ next:
 			} else if (cmd == "show-config") {
 				show_config();
 				goto next;
-			}
+			} else if (cmd == "run-script") {
+                file_script.open("wukong.script");
+                goto next;
+            }
 
 			// send commands to all proxy threads
 			for (int i = 0; i < global_num_servers; i++) {
@@ -152,7 +174,15 @@ next:
 		}
 
 		// process on all consoles
-		if (cmd == "quit" || cmd == "q") {
+        if (cmd == "stat-gdr") {
+            if (IS_MASTER(proxy)) {
+                printf("Proxy[%d:%d] GPUDirect RDMA: data_sz=%d B, #ops=%d\n",
+                        proxy->sid, proxy->tid, global_stat.gdr_data_sz, global_stat.gdr_times);
+                global_stat.reset_gdr_stats();
+            }
+            goto next;
+
+        } if (cmd == "quit" || cmd == "q") {
 			if (proxy->tid == 0)
 				exit(0); // each server exits once by the 1st proxy thread
 		} else if (cmd == "reload-config") {
@@ -169,6 +199,7 @@ next:
 			if (token == "sparql") {
 				string fname, bfname, query;
 				int cnt = 1;
+				int duration = 10, warmup = 5, parallel_factor = 20, send_interval = 0;
 				bool f_enable = false, b_enable = false, q_enable = false;
 
 				// parse parameters
@@ -181,6 +212,14 @@ next:
 					} else if (token == "-b") {
 						cmd_ss >> bfname;
 						b_enable = true;
+					} else if (token == "-d") {
+						cmd_ss >> duration;
+					} else if (token == "-w") {
+						cmd_ss >> warmup;
+					} else if (token == "-p") {
+						cmd_ss >> parallel_factor;
+					} else if (token == "-i") {
+						cmd_ss >> send_interval;
 					} else if (token == "-s") {
 						string start;
 						cmd_ss >> start;
@@ -213,6 +252,20 @@ next:
 				if (b_enable) {
 					Logger logger;
 
+                    if (duration <= 0 || warmup < 0 || parallel_factor <= 0) {
+                        cout << "[ERROR] invalid parameters for batch mode! "
+                             << "(duration=" << duration << ", warmup=" << warmup
+                             << ", parallel_factor=" << parallel_factor << ")" << endl;
+                        continue;
+                    }
+
+                    if (duration <= warmup) {
+                        cout << "Duration time (" << duration
+                             << "sec) is less than warmup time ("
+                             << warmup << "sec)." << endl;
+                        continue;
+                    }
+
                     ifstream ifs(bfname);
                     if (!ifs) {
                         PRINT_ID(proxy);
@@ -220,46 +273,39 @@ next:
                         continue ;
                     }
 
-                    if (global_enable_large_query) {
-
-                        if (proxy->tid == 0) {
-                            proxy->blocking_run_large_query(ifs, logger);
-                        } else {
-                            proxy->nonblocking_run_batch_query1(ifs, logger);
-                        }
-                    } else {
-                            proxy->nonblocking_run_batch_query2(ifs, logger);
-                    }
-
+					proxy->run_batch_query(ifs, duration, warmup, parallel_factor, send_interval, logger);
                     ifs.close();
-
-					// dedicate the master frontend worker to run a single query
-					// and others to run a set of queries if '-f' is enabled
-					// if (!f_enable || !IS_MASTER(proxy)) {
-						// ifstream ifs(bfname);
-						// if (!ifs) {
-							// PRINT_ID(proxy);
-							// cout << "Configure file not found: " << bfname << endl;
-							// continue ;
-						// }
-						// proxy->nonblocking_run_batch_query(ifs, logger);
-						// //proxy->run_batch_query(ifs, logger);
-					// }
 
 					console_barrier(proxy->tid);
 
 					// print a statistic of runtime for the batch processing on all servers
 					if (IS_MASTER(proxy)) {
+                        logger.set_figure(&fig_thpt_latency);
+
 						for (int i = 0; i < global_num_servers * global_num_proxies - 1; i++) {
 							Logger other = console_recv<Logger>(proxy->tid);
 							logger.merge(other);
 						}
-                        logger.print_cdf();
+
+                        cout << "-----------------------------------------------------" << endl;
+                        cout << "Result of " << bfname << ":" << endl;
+                        cout << "warmup: " << warmup << ", " << "duration: " << duration;
+                        cout << ", parallel_factor: " << parallel_factor << ", send_interval: " << send_interval << endl;
+                        logger.aggregate();
 						logger.print_thpt();
+                        cout << "-------------------- Figures Start ------------------" << endl;
+
+                        logger.print_cdf();
+                        logger.analyse();
+                        logger.print_data();
+                        cout << "-------------------- Figures End --------------------" << endl;
+
+                        // proxy->notify_slaves(BATCH_SENTRY_FIN);
 					} else {
 						// send logs to the master proxy
 						console_send<Logger>(0, 0, logger);
 					}
+
 				}
 
 				if (q_enable) {

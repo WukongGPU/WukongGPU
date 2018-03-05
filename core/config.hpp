@@ -14,6 +14,7 @@
  *  express or implied.  See the License for the specific language
  *  governing permissions and limitations under the License.
  *
+ *
  */
 
 #pragma once
@@ -29,15 +30,18 @@
 
 using namespace std;
 
-#define nthread_parallel_load 7
+#define nthread_parallel_load 11
 #define NUM_INSTANCES 2
 
+int global_gpu_vertex_frame_size_mb = 16;
+int global_gpu_edge_frame_size_mb = 4;
+int global_num_not_fork_join_cnt = 5;
+int global_heavy_flying_cnt = 10;
+bool global_sweep_send_to_engines = true;
 bool global_multi_instance = false;
+bool global_disable_gpudirect = false;
 
-long global_timeout_limit = 60000000;
 int global_parallel_factor = 20;
-int global_num_servers_for_large_query = 2;
-int global_num_heavy_queries = 500;
 
 bool global_print_cdf = false;
 bool global_enable_large_query = true;
@@ -100,6 +104,14 @@ void show_config(void)
 	cout << "------ global configurations ------" << endl;
 
 	// setting by config file
+    //
+	cout << "global_disable_gpudirect: "    << global_disable_gpudirect         << endl;
+	cout << "global_heavy_flying_cnt: "    << global_heavy_flying_cnt         << endl;
+	cout << "global_gpu_vertex_frame_size_mb: "  << global_gpu_vertex_frame_size_mb         << endl;
+	cout << "global_gpu_edge_frame_size_mb: "    << global_gpu_edge_frame_size_mb         << endl;
+
+	cout << "global_num_not_fork_join_cnt: "    << global_num_not_fork_join_cnt         << endl;
+	cout << "global_sweep_send_to_engines: "    << global_sweep_send_to_engines         << endl;
 	cout << "the number of engines: "		<< global_num_engines 				<< endl;
 	cout << "the number of proxies: "		<< global_num_proxies				<< endl;
 	cout << "global_input_folder: " 		<< global_input_folder				<< endl;
@@ -110,6 +122,8 @@ void show_config(void)
 	cout << "global_memstore_size_gb: " 	<< global_memstore_size_gb			<< endl;
 	cout << "global_rdma_rbf_size_mb: " 	<< global_rdma_rbf_size_mb   		<< endl;
 	cout << "global_rdma_buf_size_mb: " 	<< global_rdma_buf_size_mb			<< endl;
+	cout << "global_gpu_memstore_size_gb: " 	<< global_gpu_memstore_size_gb			<< endl;
+	cout << "global_gpu_num_keys_million: " 	<< global_gpu_num_keys_million			<< endl;
 	cout << "global_num_keys_million: " 	<< global_num_keys_million			<< endl;
 	cout << "global_use_rdma: " 			<< global_use_rdma					<< endl;
 	cout << "global_enable_caching: " 		<< global_enable_caching			<< endl;
@@ -124,10 +138,7 @@ void show_config(void)
     cout << "global_print_cdf: " << global_print_cdf << endl;
     cout << "global_enable_large_query: " << global_enable_large_query << endl;
     cout << "global_gpu_enable_pipeline: " << global_gpu_enable_pipeline << endl;
-    cout << "global_timeout_limit: " << global_timeout_limit << endl;
     cout << "global_parallel_factor: " << global_parallel_factor << endl;
-    cout << "global_num_servers_for_large_query: " << global_num_servers_for_large_query << endl;
-    cout << "global_num_heavy_queries: " << global_num_heavy_queries << endl;
 
 
 	cout << "--" << endl;
@@ -166,6 +177,14 @@ void reload_config(void)
 			global_enable_caching = atoi(entry.second.c_str());
 		else if (entry.first == "global_enable_workstealing")
 			global_enable_workstealing = atoi(entry.second.c_str());
+		else if (entry.first == "global_heavy_flying_cnt")
+			global_heavy_flying_cnt = atoi(entry.second.c_str());
+		else if (entry.first == "global_disable_gpudirect")
+			global_disable_gpudirect = atoi(entry.second.c_str());
+		else if (entry.first == "global_num_not_fork_join_cnt")
+			global_num_not_fork_join_cnt = atoi(entry.second.c_str());
+		else if (entry.first == "global_sweep_send_to_engines")
+			global_sweep_send_to_engines = atoi(entry.second.c_str());
 		else if (entry.first == "global_rdma_threshold")
 			global_rdma_threshold = atoi(entry.second.c_str());
 		else if (entry.first == "global_mt_threshold")
@@ -178,22 +197,16 @@ void reload_config(void)
 			global_enable_planner = atoi(entry.second.c_str());
 		else if (entry.first == "global_parallel_factor")
 			global_parallel_factor = atoi(entry.second.c_str());
-		else if (entry.first == "global_timeout_limit")
-			global_timeout_limit = atoi(entry.second.c_str());
 		else if (entry.first == "global_print_cdf")
 			global_print_cdf = atoi(entry.second.c_str());
 		else if (entry.first == "global_enable_large_query")
             global_enable_large_query = atoi(entry.second.c_str());
-		else if (entry.first == "global_num_servers_for_large_query")
-            global_num_servers_for_large_query = atoi(entry.second.c_str());
 		else if (entry.first == "global_enable_planner")
 			global_enable_planner = atoi(entry.second.c_str());
         else if (entry.first == "global_default_use_gpu_handle")
             global_default_use_gpu_handle = atoi(entry.second.c_str());
         else if (entry.first == "global_gpu_enable_pipeline")
             global_gpu_enable_pipeline = atoi(entry.second.c_str());
-        else if (entry.first == "global_num_heavy_queries")
-            global_num_heavy_queries = atoi(entry.second.c_str());
 		else
 			cout << "WARNING: unsupported re-configuration item! ("
 			     << entry.first << ")" << endl;
@@ -229,12 +242,22 @@ void load_config(int num_servers)
 			global_num_engines = atoi(entry.second.c_str());
 		else if (entry.first == "global_num_proxies")
 			global_num_proxies = atoi(entry.second.c_str());
+		else if (entry.first == "global_heavy_flying_cnt")
+			global_heavy_flying_cnt = atoi(entry.second.c_str());
+		else if (entry.first == "global_gpu_vertex_frame_size_mb")
+			global_gpu_vertex_frame_size_mb = atoi(entry.second.c_str());
+		else if (entry.first == "global_gpu_edge_frame_size_mb")
+			global_gpu_edge_frame_size_mb = atoi(entry.second.c_str());
+		else if (entry.first == "global_disable_gpudirect")
+			global_disable_gpudirect = atoi(entry.second.c_str());
+		else if (entry.first == "global_num_not_fork_join_cnt")
+			global_num_not_fork_join_cnt = atoi(entry.second.c_str());
+		else if (entry.first == "global_sweep_send_to_engines")
+			global_sweep_send_to_engines = atoi(entry.second.c_str());
 		else if (entry.first == "global_input_folder")
 			global_input_folder = entry.second;
 		else if (entry.first == "global_load_minimal_index")
 			global_load_minimal_index = atoi(entry.second.c_str());
-        else if (entry.first == "global_timeout_limit")
-            global_timeout_limit = atoi(entry.second.c_str());
         else if (entry.first == "global_parallel_factor")
             global_parallel_factor = atoi(entry.second.c_str());
 		else if (entry.first == "global_multi_instance")
@@ -259,8 +282,6 @@ void load_config(int num_servers)
 			global_use_rdma = atoi(entry.second.c_str());
 		else if (entry.first == "global_enable_large_query")
             global_enable_large_query = atoi(entry.second.c_str());
-		else if (entry.first == "global_num_servers_for_large_query")
-            global_num_servers_for_large_query = atoi(entry.second.c_str());
 		else if (entry.first == "global_print_cdf")
             global_print_cdf = atoi(entry.second.c_str());
 		else if (entry.first == "global_enable_caching")
@@ -293,8 +314,6 @@ void load_config(int num_servers)
             global_gpu_enable_pipeline = atoi(entry.second.c_str());
         else if (entry.first == "global_num_cuda_streams")
             global_num_cuda_streams = atoi(entry.second.c_str());
-        else if (entry.first == "global_num_heavy_queries")
-            global_num_heavy_queries = atoi(entry.second.c_str());
 		else
 			cout << "WARNING: unsupported configuration item! ("
 			     << entry.first << ")" << endl;

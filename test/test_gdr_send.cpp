@@ -3,7 +3,6 @@
 #include <iostream>
 #include <cstdio>
 
-#include "config.hpp"
 #include "mem.hpp"
 #include "string_server.hpp"
 #include "dgraph.hpp"
@@ -19,9 +18,10 @@
 
 #include "data_statistic.hpp"
 #include "gpu_mem.hpp"
+#include "gdr_transport.hpp"
 
 
-#define NUM_PACKETS 5
+#define NUM_PACKETS 3
 #define MB (1024 * 1024)
 
 
@@ -41,12 +41,111 @@ void fillBuf(char *ptr, uint32_t len) {
 }
 
 void set_config() {
+    /* global_memstore_size_gb = 1;
+     * global_num_servers = 2;
+     * global_num_gpu_engines = global_num_threads = 2;
+     * global_num_engines = 0;
+     * global_num_proxies = 0; */
+
+
     global_memstore_size_gb = 1;
     global_num_servers = 2;
-    global_num_gpu_engines = global_num_threads = 2;
-    global_num_engines = 0;
+    global_num_gpu_engines = 1;
+    global_num_engines = 1;
     global_num_proxies = 0;
+
+    global_num_threads = 2;
 }
+
+class gpu_engine {
+public:
+    RDMA_Transport *rdma_adaptor;
+    GDR_Transport * gdr_adaptor;
+    int sid;
+    int tid;
+
+    gpu_engine(RDMA_Transport *rdma_adaptor, GDR_Transport * gdr_adaptor, int sid)
+        : rdma_adaptor(rdma_adaptor), gdr_adaptor(gdr_adaptor), sid(sid)
+    {  }
+
+    void run() {
+        char *devPtr;
+        uint64_t t1, t2;
+        uint64_t size = 1;
+
+
+        printf("gpu_engine is running\n");
+        // data prepare
+        for (int i = 0; i < NUM_PACKETS; ++i) {
+            pks[i].length = (size << i) * MB;
+            pks[i].ptr = malloc(pks[i].length);
+            fillBuf(pks[i].ptr, pks[i].length);
+        }
+
+        GPU_ASSERT( cudaMalloc(&devPtr, 100 * MB) );
+        // allocate device memory
+        pks[0].devPtr = devPtr;
+        for (int i = 1; i < NUM_PACKETS - 1; ++i) {
+            pks[i].devPtr = pks[i-1].devPtr + (size << (i-1)) * MB;
+        }
+
+        // put data onto GPU
+        for (int i = 0; i < NUM_PACKETS; ++i) {
+            GPU_ASSERT( cudaMalloc(&(pks[i].devPtr), pks[i].length) );
+            GPU_ASSERT( cudaMemcpy(pks[i].devPtr, pks[i].ptr, pks[i].length, cudaMemcpyHostToDevice) );
+            memset(pks[i].ptr, 0, pks[i].length);
+        }
+
+        for (int i = 0; i < NUM_PACKETS; ++i) {
+            // GDR send to receiver
+            t1 = timer::get_usec();
+            assert(sid != 1);
+            gdr_adaptor->send(0, 1, 1, pks[i].devPtr, pks[i].length, rdma_mem_t(GPU_DRAM, CPU_DRAM));
+            t2 = timer::get_usec();
+            printf("[%d] GDR sent: %lu bytes, %luus\n", i, pks[i].length, t2 - t1);
+        }
+
+
+        cout << "Sender done" << endl;
+    }
+
+
+
+};
+
+class engine {
+public:
+    RDMA_Transport *rdma_adaptor;
+    GDR_Transport * gdr_adaptor;
+    int tid;
+
+    engine(RDMA_Transport *rdma_adaptor, GDR_Transport * gdr_adaptor)
+        : rdma_adaptor(rdma_adaptor), gdr_adaptor(gdr_adaptor)
+    {  }
+
+    void run() {
+        printf("engine is running\n");
+        while (1) {
+            timer::cpu_relax(200);
+        }
+    }
+
+};
+
+void *engine_thread(void *arg)
+{
+    engine *e = (engine *)arg;
+    e->run();
+}
+
+void *gpu_engine_thread(void *arg)
+{
+    gpu_engine *e = (gpu_engine *)arg;
+    GPU_ASSERT( cudaSetDevice(0) );
+    e->run();
+}
+
+
 
 int main(int argc, char *argv[])
 {
@@ -58,9 +157,6 @@ int main(int argc, char *argv[])
     }
 
 	int sid = atoi(argv[1]); // server ID
-    uint64_t size = 1;
-    uint64_t t1, t2, t3, t4;
-    char *devPtr;
 
     cout << "I am server " << sid << endl;
     set_config();
@@ -73,7 +169,7 @@ int main(int argc, char *argv[])
 	// allocate memory
 	Mem *mem = new Mem(global_num_servers, global_num_threads);
 	cout << "INFO#" << sid << ": allocate " << B2GiB(mem->memory_size()) << "GB memory" << endl;
-    GPUMem *gpu_mem = new GPUMem(global_num_servers, global_num_gpu_engines);
+    GPUMem *gpu_mem = new GPUMem(0, global_num_servers, global_num_gpu_engines);
 	cout << "INFO#" << sid << ": allocate " << B2GiB(gpu_mem->memory_size()) << "GB GPU memory" << endl;
 
 
@@ -83,45 +179,40 @@ int main(int argc, char *argv[])
 
 
 	// init data communication
-	RDMA_Adaptor *rdma_adaptor = NULL;
-    GDR_Adaptor *gdr_adaptor = nullptr;
+	RDMA_Transport *rdma_adaptor = NULL;
+    GDR_Transport *gdr_adaptor = nullptr;
 	if (RDMA::get_rdma().has_rdma()) {
-		rdma_adaptor = new RDMA_Adaptor(sid, mem, global_num_servers, global_num_threads);
-        gdr_adaptor = new GDR_Adaptor(sid, gpu_mem, global_num_servers, global_num_threads);
+		rdma_adaptor = new RDMA_Transport(sid, mem, global_num_servers, global_num_threads);
+        /* GDR_Transport最后一个参数传global_num_threads是为了创建与
+         * RDMA_Transport中一样数量的rmetas (num_servers x num_threads)
+         */
+        gdr_adaptor = new GDR_Transport(sid, gpu_mem, mem, global_num_servers, global_num_threads);
     }
 
 
-    // data prepare
-    for (int i = 0; i < NUM_PACKETS; ++i) {
-        pks[i].length = (size << i) * MB;
-        pks[i].ptr = malloc(pks[i].length);
-        fillBuf(pks[i].ptr, pks[i].length);
-    }
+	pthread_t *threads  = new pthread_t[global_num_threads];
+	for (int tid = 0; tid < global_num_engines + global_num_gpu_engines; tid++) {
+		if (tid < global_num_engines) {
+			engine *e = new engine(rdma_adaptor, gdr_adaptor);
+            e->tid = tid;
+			pthread_create(&(threads[tid]), NULL, engine_thread, (void *)e);
+		} else {
+            gpu_engine *ge = new gpu_engine(rdma_adaptor, gdr_adaptor, sid);
+            ge->tid = tid;
+			pthread_create(&(threads[tid]), NULL, gpu_engine_thread, (void *)ge);
+		}
+	}
 
-    GPU_ASSERT( cudaMalloc(&devPtr, 100 * MB) );
-    // allocate device memory
-    pks[0].devPtr = devPtr;
-    for (int i = 1; i < NUM_PACKETS - 1; ++i) {
-        pks[i].devPtr = pks[i-1].devPtr + (size << (i-1)) * MB;
-    }
+	// wait to all threads termination
+	for (size_t t = 0; t < global_num_threads; t++) {
+		int rc = pthread_join(threads[t], NULL);
+		if (rc) {
+			printf("ERROR: return code from pthread_join() is %d\n", rc);
+			exit(-1);
+		}
+	}
 
-    // put data onto GPU
-    for (int i = 0; i < NUM_PACKETS; ++i) {
-        GPU_ASSERT( cudaMalloc(&(pks[i].devPtr), pks[i].length) );
-        GPU_ASSERT( cudaMemcpy(pks[i].devPtr, pks[i].ptr, pks[i].length, cudaMemcpyHostToDevice) );
-        memset(pks[i].ptr, 0, pks[i].length);
-    }
-
-    for (int i = 0; i < NUM_PACKETS; ++i) {
-        // GDR send to receiver
-        t1 = timer::get_usec();
-        gdr_adaptor->send(0, 1, 0, pks[i].devPtr, pks[i].length);
-        t2 = timer::get_usec();
-        printf("[%d] GDR sent: %lu bytes, %luus\n", i, pks[i].length, t2 - t1);
-    }
-
-
-    cout << "Sender done" << endl;
+    cout << "Sender bye" << endl;
 
     return 0;
 }

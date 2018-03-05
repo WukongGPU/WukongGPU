@@ -38,7 +38,7 @@ using namespace std;
 /**
  * The communication over ZeroMQ, a distributed messaging lib
  */
-class TCP_Adaptor {
+class TCP_Transport {
 private:
     typedef tbb::concurrent_unordered_map<int, zmq::socket_t *> tbb_unordered_map;
 
@@ -56,7 +56,7 @@ private:
 
 public:
 
-    TCP_Adaptor(int sid, string fname, int num_threads, int port_base): port_base(port_base), context(1) {
+    TCP_Transport(int sid, string fname, int num_threads, int port_base): port_base(port_base), context(1) {
         ifstream hostfile(fname);
         string ip;
         while (hostfile >> ip)
@@ -75,7 +75,7 @@ public:
             pthread_spin_init(&locks[i], 0);
     }
 
-    ~TCP_Adaptor() {
+    ~TCP_Transport() {
         for (auto r : receivers)
             if (r != NULL) delete r;
 

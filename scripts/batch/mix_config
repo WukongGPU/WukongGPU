@@ -1,11 +1,11 @@
-10   10000    5     4
-batch/q1    280
-batch/q2    280
-batch/q3    30
-batch/q4    90
-batch/q5    280
-batch/q6    30
-batch/lubm_q1   2
-batch/lubm_q2   3
-batch/lubm_q3   3
-batch/lubm_q7   2
+10   4
+batch/q1    2800
+batch/q2    2800
+batch/q3    290
+batch/q4    900
+batch/q5    2800
+batch/q6    200
+batch/lubm_q1   5
+batch/lubm_q2   100
+batch/lubm_q3   100
+batch/lubm_q7   5

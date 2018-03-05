@@ -20,70 +20,55 @@
 #pragma once
 
 #include "gpu_malloc.hpp"
+#include "gpu_mem.hpp"
+#include "unit.hpp"
 
 
 class GPUMem {
 private:
     int devid;
 	int num_servers;
-	int num_threads;
+	int num_agents;
     gpu_mem_t *gmem;
 
-	// The Wukong's memory layout: kvstore | rdma-buffer | ring-buffer
-	// The rdma-buffer and ring-buffer are only used when HAS_RDMA
-	char *ptr;
+	// The GPU memory layout: sharding kvstore | history | rdma-buffer | heap
+	char *mem;
 	uint64_t mem_sz;
 
-	/* char *kvs;
-	 * uint64_t kvs_sz;
-	 * uint64_t kvs_off; */
+	// char *kvs;
+	// uint64_t kvs_sz;
+	// uint64_t kvs_off;
 
-#ifdef HAS_RDMA
 	char *buf; // #threads
 	uint64_t buf_sz;
 	uint64_t buf_off;
 
-	char *rbf; // #thread x #servers
-	uint64_t rbf_sz;
-	uint64_t rbf_off;
-#endif
-
 public:
-	GPUMem(int devid, int num_servers, int num_threads)
-		: devid(devid), num_servers(num_servers), num_threads(num_threads) {
+    GPUMem(int devid, int num_servers, int num_agents)
+        : devid(devid), num_servers(num_servers), num_agents(num_agents) {
 
-		// calculate memory usage
-		//kvs_sz = GiB2B(global_memstore_size_gb);
-#ifdef HAS_RDMA
-		buf_sz = MiB2B(global_gpu_rdma_buf_size_mb);
-		rbf_sz = MiB2B(global_gpu_rdma_rbf_size_mb);
-#endif
+        // calculate memory usage
+        // kvs_sz = GiB2B(global_memstore_size_gb);
+        buf_sz = MiB2B(global_gpu_rdma_buf_size_mb);
+        // rbf_sz = MiB2B(global_gpu_rdma_rbf_size_mb);
 
-#ifdef HAS_RDMA
-		// mem_sz = kvs_sz + buf_sz * num_threads + rbf_sz * num_servers * num_threads;
-		mem_sz = buf_sz * num_threads + rbf_sz * num_servers * num_threads;
-#else
-		// mem_sz = kvs_sz;
-#endif
+        // mem_sz = kvs_sz + buf_sz * num_agents + rbf_sz * num_servers * num_agents;
+        mem_sz = buf_sz * num_agents;
 
-		// mem = (char *)malloc(mem_sz);
-		// memset(mem, 0, mem_sz);
         gmem = GPU_Allocator::get_instance(devid).alloc(RDMA_MEM);
-        ptr = gmem->buf;
+        mem = gmem->buf;
         assert(mem_sz <= gmem->size);
 
-#ifdef HAS_RDMA
-		buf_off = 0;
-		buf = ptr + buf_off;
-		rbf_off = buf_off + buf_sz * num_threads;
-		rbf = ptr + rbf_off;
-#endif
+        buf_off = 0;
+        buf = mem + buf_off;
 
-	}
+        printf("[INFO] GPUMem: num_servers=%d, num_agents=%d\n", num_servers, num_agents);
 
-	~GPUMem() { GPU_Allocator::get_instance(devid).free(gmem); }
+    }
 
-	inline char *memory() { return ptr; }
+    ~GPUMem() { GPU_Allocator::get_instance(devid).free(gmem); }
+
+	inline char *memory() { return mem; }
 	inline uint64_t memory_size() { return mem_sz; }
 
 	// kvstore
@@ -91,16 +76,14 @@ public:
 	// inline uint64_t kvstore_size() { return kvs_sz; }
 	// inline uint64_t kvstore_offset() { return kvs_off; }
 
-#ifdef HAS_RDMA
 	// buffer
-	inline char *buffer(int tid) { return buf + buf_sz * tid; }
+	inline char *buffer(int tid) { return buf + buf_sz * (tid % num_agents); }
 	inline uint64_t buffer_size() { return buf_sz; }
-	inline uint64_t buffer_offset(int tid) { return buf_off + buf_sz * tid; }
+	inline uint64_t buffer_offset(int tid) { return buf_off + buf_sz * (tid % num_agents); }
 
 	// ring-buffer
-	inline char *ring(int tid, int sid) { return rbf + (rbf_sz * num_servers) * tid + rbf_sz * sid; }
-	inline uint64_t ring_size() { return rbf_sz; }
-	inline uint64_t ring_offset(int tid, int sid) { return rbf_off + (rbf_sz * num_servers) * tid + rbf_sz * sid; }
-#endif
+    // inline char *ring(int tid, int sid) { assert(false); }
+    // inline uint64_t ring_size() { assert(false); }
+    // inline uint64_t ring_offset(int tid, int sid) { assert(false); }
 
 }; // end of class GPUMem

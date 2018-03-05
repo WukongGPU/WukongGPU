@@ -613,36 +613,44 @@ public:
         }
 
         int pid, tid;
-        uint64_t num_triples = 0, main_hdr_cnt = 0;
+        uint64_t num_edges = 0, main_hdr_cnt = 0;
         // count triples for each predicate
         for (tid = 0; tid < nthread_parallel_load; tid++) {
             for (auto spo : triple_spo[tid]) {
                 alloc_table[tid][spo.p]++;
                 partition_szs[spo.p]++;
-                num_triples++;
+                num_edges++;
                 if (is_tpid(spo.o)) {
                     partition_szs[spo.o]++;
-                    num_triples++;
+                    num_edges++;
                 }
             }
 
             for (auto ops: triple_ops[tid]) {
                 if (is_tpid(ops.o))
                     continue;
+
+                num_edges++;
+                partition_szs[ops.p]++;
                 alloc_table[tid][ops.p]++;
             }
         }
 
-
         // allocate main headers
+        uint64_t pid_num_buckets;
         for (int i = 1; i <= num_preds; ++i) {
-            partition_szs[i] = (static_cast<double>(partition_szs[i]) / num_triples) * num_buckets;
-            pred_metas[i].partition_sz = partition_szs[i];
+            pid_num_buckets = (static_cast<double>(partition_szs[i]) / num_edges) * num_buckets;
+            // partition_szs[i] = (static_cast<double>(partition_szs[i]) / num_edges) * num_buckets;
+            if (pid_num_buckets == 0 && partition_szs[i] > 0)
+                pid_num_buckets = 1;
+
+            pred_metas[i].partition_sz = pid_num_buckets;
             pred_metas[i].main_hdr_start = main_hdr_cnt;
-            pred_metas[i].main_hdr_end = main_hdr_cnt + partition_szs[i];
-            main_hdr_cnt += partition_szs[i];
+            pred_metas[i].main_hdr_end = main_hdr_cnt + pid_num_buckets;
+            main_hdr_cnt += pid_num_buckets;
         }
 
+        assert(main_hdr_cnt <= num_buckets);
 
         // initiate keys
         #pragma omp parallel for num_threads(global_num_engines)
@@ -747,6 +755,15 @@ public:
                         // but not in vector ops
                         if (ops[sj].p != current_pid)
                             break;  // break for
+
+                        // ad-hoc fix for dbpsb_q3
+                        // if (ops[sj].p < current_pid) {
+                            // pid = ops[sj].p;
+                            // assert(alloc_table[tid][pid] > 0);
+                            // assert(pred_metas[pid].partition_sz > 0);
+                            // off = sync_fetch_and_alloc_edges(alloc_table[tid][pid]);
+                            // current_pid = pid;
+                        // }
 
                         while ((ej < ops.size())
                                 && (ops[sj].o == ops[ej].o)

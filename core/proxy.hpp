@@ -25,6 +25,7 @@
 #include <signal.h>
 #include <sys/time.h>
 #include <map>
+#include <unistd.h>
 
 #include "config.hpp"
 #include "coder.hpp"
@@ -36,11 +37,10 @@
 
 #include "mymath.hpp"
 #include "timer.hpp"
+#include "mem.hpp"
 
 #include "planner.hpp"
 #include "data_statistic.hpp"
-
-volatile int recv_large_cnt = 0;
 
 static void proxy_barrier(int tid)
 {
@@ -48,7 +48,7 @@ static void proxy_barrier(int tid)
 	static __thread int _next = 1;
 
 	// inter-server barrier
-	if (tid == 0)
+    if (tid == 0)
 		MPI_Barrier(MPI_COMM_WORLD);
 
 	// intra-server barrier
@@ -67,6 +67,7 @@ class Proxy {
 private:
     map<string, vector<int>> type_cache;
 
+    Mem *mem;
 
     /**
      * @return false for timeout
@@ -82,6 +83,7 @@ private:
                 cout << "cache hit: " << type << " has " << req_template.ptypes_grp[i].size() << " candidates" << endl;
                 continue;
             }
+
 			request_or_reply type_request, type_reply;
 
 			// a TYPE query to collect constants with the certain type
@@ -97,9 +99,6 @@ private:
             assert(type_request.comp_dev == CPU_comp);
 			send_request(type_request);
 			type_reply = recv_reply();
-
-            if (type_reply.dummy)
-                return false;
 
 			vector<int> candidates(type_reply.result_table);
 			// There is no candidate with the Type for a random-constant in the template
@@ -130,9 +129,10 @@ public:
     data_statistic *statistic;
 
 
-	Proxy(int sid, int tid, String_Server *str_server, Adaptor *adaptor, data_statistic *statistic )
+	Proxy(int sid, int tid, String_Server *str_server, Adaptor *adaptor, data_statistic *statistic, Mem *mem)
 		: sid(sid), tid(tid), str_server(str_server), adaptor(adaptor),
-          coder(sid, tid), parser(str_server), statistic(statistic) { }
+          coder(sid, tid), parser(str_server), statistic(statistic), mem(mem) { }
+
 
 	void setpid(request_or_reply &r) { r.pid = coder.get_and_inc_qid(); }
 
@@ -140,7 +140,6 @@ public:
 		assert(r.pid != -1);
 
 		if (r.start_from_index()) {
-            printf("INFO#%d: [Proxy] large query!\n", sid);
 			for (int i = 0; i < global_num_servers; i++) {
                 if(r.comp_dev == GPU_comp && global_default_use_gpu_handle) {
                     //if it should be calculated by GPU, send it to GPU worker
@@ -174,8 +173,6 @@ public:
 
 	request_or_reply recv_reply(void) {
 		request_or_reply r = adaptor->recv();
-        if (r.dummy)
-            return r;
 
 		if (r.start_from_index()) {
             int mt_threshold = (r.comp_dev == GPU_comp ? 1 : global_mt_threshold);
@@ -195,7 +192,7 @@ public:
 
 	bool tryrecv_reply(request_or_reply &r) {
 		bool success = adaptor->tryrecv(r);
-		if (success && r.start_from_index()) {
+		if (success && r.start_from_index() && false) {
             // TODO: avoid parallel submit for try recieve mode
             cout << "Unsupport try recieve parallel query now!" << endl;
             assert(false);
@@ -274,349 +271,189 @@ public:
 	}
 
 
-
-	void blocking_run_large_query(istream &is, Logger &logger) {
-		int ntypes;
-		int nqueries;
-		int try_round = 1;
-        int nlarge_types = 0;
-		int send_cnt = 0, recv_cnt = 0, nsl_cnt = 0;
-
-        assert(global_enable_large_query == true);
-
-        is >> ntypes >> nqueries >> try_round >> nlarge_types;
-
-        int nsmall_types = ntypes - nlarge_types;
-        vector<request_template> tpls(nsmall_types);
-        vector<request_or_reply> nsl_reqs(nlarge_types);
-        vector<int> loads(ntypes);
-
-		for (int i = 0; i < ntypes; i++) {
-			string fname;
-			is >> fname;
-			ifstream ifs(fname);
-			if (!ifs) {
-				cout << "Query file not found: " << fname << endl;
-				return ;
-			}
-
-			int load;
-			is >> load;
-			assert(load > 0);
-			loads[i] = load;
-            // skip selective queries
-            if (i < nsmall_types)
-                continue;
-
-			bool success = parser.parse(ifs, nsl_reqs[i - nsmall_types]);
-            ifs.close();
-
-			if (!success) {
-				cout << "ERROR: sparql parse error" << endl;
-				return ;
-			}
-		}
-
-        proxy_barrier(tid);
-
-		logger.init(ntypes);
-
-        // nqueries = (int)(nqueries * (0.05 / global_num_servers_for_large_query));
-        nqueries = global_num_heavy_queries / global_num_servers;
-        for (int i = 0; i < nqueries; i++) {
-            int idx = nsmall_types + i % nlarge_types;
-            request_or_reply request;
-
-            // generate large query
-            request = nsl_reqs[idx - nsmall_types];
-            request.comp_dev = GPU_comp;
-            nsl_cnt ++;
-            setpid(request);
-
-            request.blind = true; // avoid send back results by default
-            logger.start_record(request.pid, idx);
-            send_request(request);
-            send_cnt ++;
-
-            // for non-selective query, we must receive the reply before sending other queries
-            request_or_reply r;
-            r = recv_reply();
-            assert(r.pid == request.pid);
-            recv_cnt++;
-            recv_large_cnt++;
-            logger.end_record(r.pid);
-            if (send_cnt > 0 && send_cnt % 50 == 0)
-                printf("Blocking Proxy[sid:%d,tid:%d] has sent %d queries.\n", sid, tid, send_cnt);
-        }
-
-done:
-        printf("Blocking Proxy[sid:%d,tid:%d] finish its work. send_cnt: %d, recv_cnt: %d, nsl_cnt: %d\n", sid, tid, send_cnt, recv_cnt, nsl_cnt);
-        logger.finish();
-
-        assert(recv_large_cnt == nqueries);
-
-	}
-
-
-	void nonblocking_run_batch_query1(istream &is, Logger &logger) {
-		int ntypes;
-		int nqueries;
-		int try_round = 1;
-        int nlarge_types = 0;
-		int send_cnt = 0, recv_cnt = 0, nsl_cnt = 0;
-
-        assert(global_enable_large_query == true);
-        is >> ntypes >> nqueries >> try_round >> nlarge_types;
-
-        int nsmall_types = ntypes - nlarge_types;
-        vector<request_template> tpls(nsmall_types);
-        vector<int> loads(ntypes);
-
-		for (int i = 0; i < ntypes; i++) {
-			string fname;
-			is >> fname;
-			ifstream ifs(fname);
-			if (!ifs) {
-				cout << "Query file not found: " << fname << endl;
-				return ;
-			}
-
-			int load;
-			is >> load;
-			assert(load > 0);
-			loads[i] = load;
-
-            // skil non-selective queries
-            if (i >= nsmall_types)
-                continue;
-
-			bool success = parser.parse_template(ifs, tpls[i]);
-            ifs.close();
-
-			if (!success) {
-				cout << "ERROR: Template parse failed!" << endl;
-				return;
-			}
-
-            success = fill_template(tpls[i]);
-            if (!success) {
-                printf("Proxy[sid:%d,tid:%d] >>>>>>>>>> Timeout from fill_template!.\n", sid, tid);
-                goto done;
-            }
-		}
-
-        proxy_barrier(tid);
-
-		logger.init(ntypes);
-        int nlarge = global_num_heavy_queries / global_num_servers;
-        while (recv_large_cnt < nlarge) {
-
-			for (int t = 0; t < global_parallel_factor; t++) {
-                int idx = mymath::get_distribution(coder.get_random(), loads);
-                // only generate selective queries
-                while (idx >= nsmall_types)
-                    idx = mymath::get_distribution(coder.get_random(), loads);
-
-                request_or_reply request;
-                request = tpls[idx].instantiate(coder.get_random());
-                assert(request.comp_dev == CPU_comp);
-                setpid(request);
-                request.blind = true; // avoid send back results by default
-                logger.start_record(request.pid, idx);
-
-                send_request(request);
-                send_cnt ++;
-                if (send_cnt > 0 && send_cnt % 5000 == 0)
-                    printf("Proxy[sid:%d,tid:%d] has sent %d queries.\n", sid, tid, send_cnt);
-			}
-
-			// wait a piece of time and try several times
-			for (int i = 0; i < try_round; i++) {
-				timer::cpu_relax(100);
-
-				// try to recieve the replies (best of effort)
-				request_or_reply r;
-				bool success = tryrecv_reply(r);
-				while (success) {
-                    recv_cnt ++;
-                    logger.end_record(r.pid);
-					success = tryrecv_reply(r);
-				}
-			}
-		}
-
-done:
-        printf("Proxy[sid:%d,tid:%d] finish its work. send_cnt: %d, recv_cnt: %d, nsl_cnt: %d\n", sid, tid, send_cnt, recv_cnt, nsl_cnt);
-        logger.finish();
-	}
-
-	void nonblocking_run_batch_query2(istream &is, Logger &logger) {
-		int ntypes;
-		int nqueries;
-		int try_round = 1;
-        int nlarge_types = 0;
-		int send_cnt = 0, recv_cnt = 0, nsl_cnt = 0;
-
-        assert(global_enable_large_query == false);
-        is >> ntypes >> nqueries >> try_round >> nlarge_types;
-
-
-        int nsmall_types = ntypes - nlarge_types;
-        vector<request_template> tpls(nsmall_types);
-        vector<int> loads(ntypes);
-
-		for (int i = 0; i < ntypes; i++) {
-			string fname;
-			is >> fname;
-			ifstream ifs(fname);
-			if (!ifs) {
-				cout << "Query file not found: " << fname << endl;
-				return ;
-			}
-
-			int load;
-			is >> load;
-			assert(load > 0);
-			loads[i] = load;
-
-            // skil non-selective queries
-            if (i >= nsmall_types)
-                continue;
-
-			bool success = parser.parse_template(ifs, tpls[i]);
-            ifs.close();
-
-			if (!success) {
-				cout << "ERROR: Template parse failed!" << endl;
-				return;
-			}
-
-            success = fill_template(tpls[i]);
-            if (!success) {
-                printf("Proxy[sid:%d,tid:%d] >>>>>>>>>> Timeout from fill_template!.\n", sid, tid);
-                goto done;
-            }
-		}
-
-        proxy_barrier(tid);
-
-		logger.init(ntypes);
-        while (recv_cnt < nqueries) {
-
-			for (int t = 0; t < global_parallel_factor; t++) {
-
-                int idx = mymath::get_distribution(coder.get_random(), loads);
-                // only generate selective queries
-                while (idx >= nsmall_types)
-                    idx = mymath::get_distribution(coder.get_random(), loads);
-
-                request_or_reply request;
-                request = tpls[idx].instantiate(coder.get_random());
-                assert(request.comp_dev == CPU_comp);
-                setpid(request);
-                request.blind = true; // avoid send back results by default
-                logger.start_record(request.pid, idx);
-
-                send_request(request);
-                send_cnt ++;
-                if (send_cnt > 0 && send_cnt % 5000 == 0)
-                    printf("Proxy[sid:%d,tid:%d] has sent %d queries.\n", sid, tid, send_cnt);
-			}
-
-			// wait a piece of time and try several times
-			for (int i = 0; i < try_round; i++) {
-				timer::cpu_relax(100);
-
-				// try to recieve the replies (best of effort)
-				request_or_reply r;
-				bool success = tryrecv_reply(r);
-				while (success) {
-                    recv_cnt ++;
-                    logger.end_record(r.pid);
-					success = tryrecv_reply(r);
-				}
-			}
-		}
-
-done:
-        printf("Proxy[sid:%d,tid:%d] finish its work. send_cnt: %d, recv_cnt: %d, nsl_cnt: %d\n", sid, tid, send_cnt, recv_cnt, nsl_cnt);
-        logger.finish();
-	}
-
-
-    void run_batch_query(istream &is, Logger &logger) {
-        int ntypes;
-        int nqueries;
-        int try_round = 1; // dummy
-
-        is >> ntypes >> nqueries >> try_round;
-
-        vector<int> loads(ntypes);
-        vector<request_template> tpls(ntypes);
-
-        // prepare various temples
-        for (int i = 0; i < ntypes; i++) {
-               string fname;
-               is >> fname;
-               ifstream ifs(fname);
-               if (!ifs) {
-                       cout << "Query file not found: " << fname << endl;
-                       return ;
-               }
-
-               int load;
-               is >> load;
-               assert(load > 0);
-               loads[i] = load;
-
-               bool success = parser.parse_template(ifs, tpls[i]);
-               if (!success) {
-                       cout << "sparql parse error" << endl;
-                       return ;
-               }
-               fill_template(tpls[i]);
-        }
-
-        logger.init();
-        // send global_parallel_factor queries and keep global_parallel_factor flying queries
-        for (int i = 0; i < global_parallel_factor; i++) {
-               int idx = mymath::get_distribution(coder.get_random(), loads);
-               request_or_reply r = tpls[idx].instantiate(coder.get_random());
-
-               setpid(r);
-               r.blind = true;  // avoid send back results by default
-               logger.start_record(r.pid, idx);
-               send_request(r);
-        }
-
-           // recv one query, and then send another query
-        for (int i = 0; i < nqueries - global_parallel_factor; i++) {
-               // recv one query
-               request_or_reply r2 = recv_reply();
-               logger.end_record(r2.pid);
-
-               // send another query
-               int idx = mymath::get_distribution(coder.get_random(), loads);
-               request_or_reply r = tpls[idx].instantiate(coder.get_random());
-
-               setpid(r);
-               r.blind = true;  // avoid send back results by default
-               logger.start_record(r.pid, idx);
-               send_request(r);
-        }
-
-        // recv the rest queries
-        for (int i = 0; i < global_parallel_factor; i++) {
-               request_or_reply r = recv_reply();
-               logger.end_record(r.pid);
-        }
-
-        logger.finish();
-        logger.print_thpt();
-
+    /* mixed light & heavy */
+    inline bool is_fork_join(int idx) {
+        return idx == 6 || idx == 9;
     }
 
+    inline int idx_for_q2q3(void) {
+        return (7 + coder.get_random() % 2);
+    }
+    inline int idx_for_q1q7(void) {
+        static int arr[2] = {6, 9};
+        return arr[ coder.get_random() % 2 ];
+    }
+
+	int run_batch_query(istream &is, int d, int w, int p, int i, Logger &logger) {
+		uint64_t duration = SEC(d);
+		uint64_t warmup = SEC(w);
+        uint64_t send_interval = MSEC(i);
+		int parallel_factor = p;
+		int try_rounds = 5;
+
+		int ntypes, nsmall_types, nlarge_types;
+		is >> ntypes >> nlarge_types;
+
+		if (ntypes <= 0) {
+			cout << "[ERROR] invalid #query_types! (" << ntypes << " < 0)" << endl;
+			return -2; // parsing failed
+		}
+
+        nsmall_types = ntypes - nlarge_types;
+		vector<request_template> tpls(nsmall_types);
+        vector<request_or_reply> nsl_reqs(nlarge_types);
+		vector<int> loads(ntypes);
+
+        // prepare work
+		for (int i = 0; i < ntypes; i++) {
+			string fname;
+			is >> fname;
+			ifstream ifs(fname);
+			if (!ifs) {
+				cout << "[ERROR] Query file not found: " << fname << endl;
+				return -1; // file not found
+			}
+
+			int load;
+			is >> load;
+			assert(load > 0);
+			loads[i] = load;
+
+			// bool success = parser.parse_template(ifs, tpls[i]);
+            bool success = (i >= nsmall_types) ?
+                    parser.parse(ifs, nsl_reqs[i - nsmall_types]):
+                    parser.parse_template(ifs, tpls[i]);
+
+            ifs.close();
+
+			if (!success) {
+				cout << "[ERROR] Template parsing failed!" << endl;
+				return -2; // parsing failed
+			}
+
+            if (i < nsmall_types) {
+                fill_template(tpls[i]);
+            }
+		}
+
+		logger.init(nsmall_types, nlarge_types, parallel_factor);
+
+        proxy_barrier(tid);
+
+        if (sid == 0 && tid == 0) {
+            printf(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>  [MASTER]: start to work!\n");
+        } else {
+            printf("[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[  [SLAVE]: start to work!\n");
+        }
+
+		bool timing = false;
+		int send_cnt = 0, recv_cnt = 0,
+            send_light_cnt = 0, send_heavy_cnt = 0,
+            recv_light_cnt = 0, recv_heavy_cnt = 0,
+            flying_light_cnt = 0, flying_heavy_cnt = 0;
+        int start_thpt_cnt = 0, end_thpt_cnt = 0;
+		uint64_t init = timer::get_usec();
+		while ((timer::get_usec() - init) < duration) {
+			// send requests
+			for (int t = 0; t < parallel_factor; t++) {
+				int idx = mymath::get_distribution(coder.get_random(), loads);
+				request_or_reply request;
+
+                if (idx >= nsmall_types) {  // large query
+                    if (flying_heavy_cnt >= parallel_factor || flying_heavy_cnt >= global_heavy_flying_cnt)
+                        continue;
+
+                    request = nsl_reqs[idx - nsmall_types];
+                    request.comp_dev = GPU_comp;
+
+                } else {    // light query
+                    if (flying_light_cnt >= parallel_factor)
+                        continue;
+                    request = tpls[idx].instantiate(coder.get_random());
+                }
+
+                if (flying_light_cnt >= parallel_factor && flying_heavy_cnt >= parallel_factor) {
+                    printf("[ERROR] Proxy[%d:%d] send rate is too high!\n", sid, tid);
+                    assert(false);
+                }
+
+				if (global_enable_planner)
+					planner.generate_plan(request, statistic);
+
+				setpid(request);
+				request.blind = true; // always not take back results in batch mode
+
+                if (request.start_from_index()) {
+                    assert(request.comp_dev == GPU_comp);
+                    logger.start_record(request.pid, idx, true);
+                    send_heavy_cnt ++;
+                } else {
+				    logger.start_record(request.pid, idx);
+                    send_light_cnt ++;
+                }
+
+				send_request(request);
+				send_cnt++;
+			}   // end send request loop
+
+            // Siyuan: 要减慢发送的速度，那么就在receive这里做文章，
+            // 比如我希望发送间隔是1s(1000ms)，那么在发完reqs之后，我就sleep(1ms)
+            // wakeup之后去recv reply，然后继续sleep(1ms），醒来后去recv...
+            // 一直循环到1s。
+            uint64_t sleep_begin = timer::get_usec();
+            uint64_t sleep_unit = send_interval > 0 ? MSEC(1) : 0;
+
+            do {
+                // receive replies (best of effort)
+                for (int i = 0; i < try_rounds; i++) {
+                    request_or_reply r;
+                    while (tryrecv_reply(r)) {
+                        if (!r.start_from_index())
+                            recv_light_cnt ++;
+
+                        recv_cnt = logger.end_record(r.pid);
+                        recv_heavy_cnt = recv_cnt - recv_light_cnt;
+                    }
+                }
+
+                usleep(sleep_unit);
+            } while ((timer::get_usec() - sleep_begin) < send_interval);
 
 
+            // for brevity, only print the timely thpt of master proxy.
+            if (sid == 0 && tid == 0)
+    			logger.print_timely_thpt(recv_light_cnt, recv_heavy_cnt);
+
+			// requests during warmup not included in thpt calculation
+			if (!timing && (timer::get_usec() - init) >= warmup) {
+                start_thpt_cnt = recv_cnt;
+				logger.start_calc_thpt(recv_light_cnt, recv_heavy_cnt, send_cnt);
+                printf("Proxy[%d:%d]: start_thpt_cnt=%d\n", sid, tid, start_thpt_cnt);
+				timing = true;
+			}
+
+            flying_light_cnt = send_light_cnt - recv_light_cnt;
+            flying_heavy_cnt = send_heavy_cnt - recv_heavy_cnt;
+
+		} // end main loop
+
+		logger.end_calc_thpt(recv_light_cnt, recv_heavy_cnt, send_cnt);
+        end_thpt_cnt = recv_cnt;
+
+		// recieve all replies to calculate the tail latency
+        printf("Proxy[%d:%d]: end_thpt_cnt=%d\n", sid, tid, end_thpt_cnt);
+        while (recv_cnt < send_cnt) {
+            request_or_reply r;
+            while (tryrecv_reply(r)) {
+                recv_cnt = logger.end_record(r.pid);
+            }
+        }
+
+        logger.finish();
+        printf("Proxy[%d:%d] Finished. send_cnt=%d, send_heavy_cnt=%d, send_light_cnt=%d, thpt_cnt=%d, tail_cnt=%d\n",
+                sid, tid, send_cnt, send_heavy_cnt, send_light_cnt, (end_thpt_cnt - start_thpt_cnt), (recv_cnt - end_thpt_cnt));
+
+		return 0; // success
+	}
 
 };

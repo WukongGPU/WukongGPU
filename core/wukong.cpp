@@ -14,7 +14,6 @@
  *  express or implied.  See the License for the specific language
  *  governing permissions and limitations under the License.
  *
- *
  */
 
 #include <boost/mpi.hpp>
@@ -24,16 +23,14 @@
 #include <map>
 #include <string.h>
 
-#include "config.hpp"
 #include "mem.hpp"
 #include "string_server.hpp"
 #include "dgraph.hpp"
 #include "engine.hpp"
-#include "gpu_engine.hpp"
 #include "proxy.hpp"
 #include "console.hpp"
 #include "monitor.hpp"
-#include "rdma_resource.hpp"
+#include "rdma_transport.hpp"
 #include "adaptor.hpp"
 
 #include "unit.hpp"
@@ -41,8 +38,13 @@
 #include "data_statistic.hpp"
 
 #include "gpu_mem.hpp"
-#include "gdr_adaptor.hpp"
+#include "gdr_transport.hpp"
+#include "gpu_engine.hpp"
 #include "rdf_meta.hpp"
+#include "gpu_stream.hpp"
+#include "rcache.hpp"
+#include "agent_adaptor.hpp"
+#include "taskq_meta.hpp"
 
 using namespace std;
 
@@ -141,7 +143,7 @@ usage(char *fn)
 }
 
 static void
-send_pred_metas(int sid, TCP_Adaptor *tcp, DGraph &dgraph)
+send_pred_metas(int sid, TCP_Transport *tcp, DGraph &dgraph)
 {
     std::stringstream ss;
     std::string str;
@@ -163,7 +165,7 @@ send_pred_metas(int sid, TCP_Adaptor *tcp, DGraph &dgraph)
 }
 
 static void
-recv_pred_metas(int sid, TCP_Adaptor *tcp, tbb::concurrent_unordered_map<int, vector<pred_meta_t> > &global_pred_metas)
+recv_pred_metas(int sid, TCP_Transport *tcp, tbb::concurrent_unordered_map<int, vector<pred_meta_t> > &global_pred_metas)
 {
     std::string str;
 
@@ -222,7 +224,7 @@ main(int argc, char *argv[])
     extern struct config_t rdma_config;
     if (global_multi_instance) {
         cout << "INFO#" << sid << " running in multiple instances mode" << endl;
-        char *ibdevs[] = {"mlx5_0", "mlx5_1"};
+        char *ibdevs[] = {"mlx4_0", "mlx4_1"};
         devid = sid % NUM_INSTANCES;
         strncpy(rdma_config.dev_name, ibdevs[devid], strlen(ibdevs[devid]) + 1);
     }
@@ -256,14 +258,14 @@ main(int argc, char *argv[])
 #endif
 
 	// init data communication
-	RDMA_Adaptor *rdma_adaptor = NULL;
-    GDR_Adaptor *gdr_adaptor = nullptr;
+	RDMA_Transport *rdma_transport = NULL;
+    GDR_Transport *gdr_transport = nullptr;
 	if (RDMA::get_rdma().has_rdma()) {
-		rdma_adaptor = new RDMA_Adaptor(sid, mem, global_num_servers, global_num_threads);
-        gdr_adaptor = new GDR_Adaptor(sid, gpu_mem, global_num_servers, global_num_gpu_engines);
+		rdma_transport = new RDMA_Transport(sid, mem, global_num_servers, global_num_threads);
+        gdr_transport = new GDR_Transport(sid, gpu_mem, mem, global_num_servers, global_num_gpu_engines);
     }
 
-	TCP_Adaptor *tcp_adaptor = new TCP_Adaptor(sid, host_fname, global_num_threads, global_data_port_base);
+	TCP_Transport *tcp_transport = new TCP_Transport(sid, host_fname, global_num_threads, global_data_port_base);
 
 	// load string server (read-only, shared by all proxies)
 	String_Server str_server(global_input_folder);
@@ -280,29 +282,31 @@ main(int argc, char *argv[])
     // std::map<int, std::vector<pred_meta_t>> global_pred_metas;
 
     // synchronize predicate metadatas
-    send_pred_metas(sid, tcp_adaptor, dgraph);
-    recv_pred_metas(sid, tcp_adaptor, global_pred_metas);
+    send_pred_metas(sid, tcp_transport, dgraph);
+    recv_pred_metas(sid, tcp_transport, global_pred_metas);
     dgraph.gstore.set_global_pred_metas(global_pred_metas);
 
+    TaskQ_Meta::init(global_num_servers, global_num_threads);
+    GPU::instance().init(&dgraph.gstore, &rcache, rcache.shardmanager);
 
 
   // prepare data for planner
-  data_statistic stat(tcp_adaptor, &world);
-  if (global_enable_planner) {
-      dgraph.gstore.generate_statistic(stat);
-      stat.gather_data();
-  }
+  // data_statistic stat(tcp_adaptor, &world);
+  // if (global_enable_planner) {
+      // dgraph.gstore.generate_statistic(stat);
+      // stat.gather_data();
+  // }
 
 	// init control communicaiton
-	con_adaptor = new TCP_Adaptor(sid, host_fname, global_num_proxies, global_ctrl_port_base);
+    con_adaptor = new TCP_Transport(sid, host_fname, global_num_proxies, global_ctrl_port_base);
 
 	// launch proxy and engine threads
 	assert(global_num_threads == global_num_proxies + global_num_engines + global_num_gpu_engines);
 	pthread_t *threads  = new pthread_t[global_num_threads];
 	for (int tid = 0; tid < global_num_proxies + global_num_engines; tid++) {
-    		Adaptor *adaptor = new Adaptor(tid, tcp_adaptor, rdma_adaptor, gdr_adaptor);
+    		Adaptor *adaptor = new Adaptor(tid, tcp_transport, rdma_transport);
 		if (tid < global_num_proxies) {
-			Proxy *proxy = new Proxy(sid, tid, &str_server, adaptor, &stat);
+			Proxy *proxy = new Proxy(sid, tid, &str_server, adaptor, nullptr, mem);
 			pthread_create(&(threads[tid]), NULL, proxy_thread, (void *)proxy);
 			proxies.push_back(proxy);
 		} else {
@@ -312,12 +316,12 @@ main(int argc, char *argv[])
 		}
 	}
 
-    // launch gpu engine thread 
+    // launch gpu engine thread
     for (int tid = global_num_proxies + global_num_engines; tid < global_num_threads; tid++) {
-    		Adaptor *adaptor = new Adaptor(tid, tcp_adaptor, rdma_adaptor, gdr_adaptor);
+            Agent_Adaptor *adaptor = new Agent_Adaptor(tid, tcp_transport, rdma_transport, gdr_transport);
 			GPU_Engine *gpu_engine = new GPU_Engine(devid, sid, tid, &rcache, adaptor);
 			pthread_create(&(threads[tid]), NULL, gpu_engine_thread, (void *)gpu_engine);
-			gpu_engines.push_back(gpu_engine);
+            gpu_engines.push_back(gpu_engine);
     }
 
 	// wait to all threads termination

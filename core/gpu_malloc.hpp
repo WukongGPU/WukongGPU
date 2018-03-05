@@ -4,16 +4,6 @@
 #include "config.hpp"
 #include "unit.hpp"
 
-#define GPU_ASSERT(ans) { gpuCheckResult((ans), __FILE__, __LINE__); }
-inline void gpuCheckResult(cudaError_t code, const char *file, int line, bool abort=true)
-{
-   if (code != cudaSuccess)
-   {
-      fprintf(stderr,"GPUassert: code:%d, %s %s:%d\n", code, cudaGetErrorString(code), file, line);
-      if (abort) assert(false);
-   }
-}
-
 // implement a GPU memory allocator
 enum gpu_mem_type {
     RDMA_MEM,
